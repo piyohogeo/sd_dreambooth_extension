@@ -42,6 +42,8 @@ class DreamboothConfig(BaseModel):
     dataset_mix_split_size: int = 1
     deterministic: bool = False
     ema_predict: bool = False
+    ewc_lambda: float = 1e-5
+    ewc_params_path: str = ""
     epoch: int = 0
     epoch_pause_frequency: int = 0
     epoch_pause_time: int = 0
@@ -115,6 +117,7 @@ class DreamboothConfig(BaseModel):
     save_lora_for_extra_net: bool = True
     save_preview_every: int = 5
     save_params_step: bool = False
+    save_params_stat: bool = False
     save_safetensors: bool = True
     save_state_after: bool = False
     save_state_cancel: bool = False

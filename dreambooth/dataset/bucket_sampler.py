@@ -2,10 +2,16 @@ import random
 from typing import Tuple, Dict, List
 
 import numpy as np
+from torch import randperm
 from torch.utils.data import ConcatDataset, Dataset
 from torch.utils.data.sampler import BatchSampler
 
 from dreambooth.dataset.db_dataset import DbDatasetForResolution
+
+
+# x10 slower than random.shuffle
+def torch_shuffle(xs):
+    return [xs[i] for i in randperm(len(xs))]
 
 
 def build_weighted_sample_indexes(weights, output_length: int):
@@ -125,6 +131,8 @@ class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
                                      DbDatasetForResolution],
             interleave_size: int = 1
             ) -> Tuple[BatchSampler, Dataset]:
+        print(res_instance_datasets.keys()) 
+        print(res_class_datasets.keys()) 
         assert set(res_instance_datasets.keys())\
             == set(res_class_datasets.keys())
         samplers = [InstanceBalancedBatchSampler(

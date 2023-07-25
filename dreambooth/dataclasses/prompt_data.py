@@ -25,15 +25,8 @@ class PromptData:
             self.seed = int(random.randrange(0, 21474836147))
 
     @property
-    def __dict__(self):
-        """
-        get a python dictionary
-        """
-        return asdict(self)
-
-    @property
     def json(self):
         """
         get the json formated string
         """
-        return json.dumps(self.__dict__)
+        return json.dumps(asdict(self))

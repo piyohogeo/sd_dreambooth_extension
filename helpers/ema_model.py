@@ -38,7 +38,8 @@ class EMAModel(object):
 
         self.decay = decay
         self.model = copy.deepcopy(model)
-        self.model.to(device, dtype=dtype)
+        # aoivd accelerate error
+        # self.model.to(device, dtype=dtype)
 
         self.params = {}
         self.build_params()

@@ -1,6 +1,9 @@
 import copy
+import hashlib
+import io
 import os.path
 import random
+import threading
 import traceback
 from typing import List, Tuple, Union
 
@@ -16,7 +19,6 @@ from dreambooth.utils.image_utils import make_bucket_resolutions, \
     closest_resolution, shuffle_tags, open_and_trim
 from dreambooth.utils.text_utils import build_strict_tokens
 from helpers.mytqdm import mytqdm
-
 
 class DbDataset(torch.utils.data.Dataset):
     """
@@ -47,8 +49,6 @@ class DbDataset(torch.utils.data.Dataset):
         print("Init dataset!")
         # A dictionary of string/latent pairs matching image paths
         self.latents_cache = {}
-        # A dictionary of string/input_ids(s) pairs matching image paths
-        self.caption_cache = {}
         # A dictionary of (int, int) / List[(string, string)] of resolutions and the corresponding image paths/captions
         self.train_dict = {}
         # A dictionary of (int, int) / List[(string, string)] of resolutions and the corresponding image paths/captions
@@ -82,6 +82,7 @@ class DbDataset(torch.utils.data.Dataset):
         self.strict_tokens = strict_tokens
         self.tokens = tokens
         self.vae = None
+        self.vae_hash = None
         self.cache_latents = False
         flip_p = 0.5 if hflip else 0.0
         if hflip:
@@ -101,62 +102,50 @@ class DbDataset(torch.utils.data.Dataset):
                 ]
             )
 
-    def load_image(self, image_path, caption, res):
-        if self.debug_dataset:
-            image = os.path.splitext(image_path)
-            input_ids = caption
+    def load_image(self, image_path, res):
+        if self.cache_latents:
+            image = self.latents_cache[image_path]
         else:
-            if self.cache_latents:
-                image = self.latents_cache[image_path]
-            else:
-                img = open_and_trim(image_path, res, False)
-                image = self.image_transforms(img)
-            if self.shuffle_tags:
-                caption, parameters = self.cache_caption(image_path, caption)
-            else:
-                parameters = self.caption_cache[image_path]
-        return image, parameters
+            img = open_and_trim(image_path, res, False)
+            image = self.image_transforms(img)
+        return image
+
+    def _get_vae_hash(self):
+        if self.vae_hash is None:
+            if self.vae is not None:
+                f = io.BytesIO()
+                torch.save(sorted(self.vae.state_dict()), f=f)
+                self.vae_hash = hashlib.sha256(f.getbuffer())
+                # DEBUG
+                print('vae hash:', self.vae_hash.hexdigest())
+        return self.vae_hash
 
     def cache_latent(self, image_path, res):
         if self.vae is not None:
-            image = open_and_trim(image_path, res, False)
-            img_tensor = self.image_transforms(image)
-            img_tensor = img_tensor.unsqueeze(0).to(device=self.vae.device, dtype=self.vae.dtype)
-            latents = self.vae.encode(img_tensor).latent_dist.sample().squeeze(0).to("cpu")
-            self.latents_cache[image_path] = latents
-
-    def cache_caption(self, image_path, caption, negative_caption='EasyNegative, bad-hands-5, bad hands, poorly drawn hands, mutated hands, extra fingers, missing fingers, ugly fingers, melted fingers, (worst quality:2.0), (low quality:2.0), normal quality, blurry, bad anatomy, bad-artist, poor colors, low quality clothes, 3D, CG, less details'):
-        input_ids = None
-        uncond_input_ids = None
-        auto_add_special_tokens = False if self.strict_tokens else True
-        if self.tokenizer is not None and (image_path not in self.caption_cache or self.debug_dataset):
-            if self.shuffle_tags:
-                caption = shuffle_tags(caption)
-            if self.strict_tokens:
-                caption = build_strict_tokens(caption, self.tokenizer.bos_token, self.tokenizer.eos_token)
-            if self.not_pad_tokens:
-                input_ids = self.tokenizer(caption, padding=True, truncation=True,
-                                           add_special_tokens=auto_add_special_tokens,
-                                           return_tensors="pt").input_ids
-                uncond_input_ids = self.tokenizer(negative_caption, padding=True, truncation=True,
-                                                    add_special_tokens=auto_add_special_tokens,
-                                                    return_tensors="pt").input_ids
+            image_path_dir, image_path_filename = os.path.split(image_path)
+            latent_dir = os.path.join(image_path_dir,
+                                      'latents',
+                                      self._get_vae_hash().hexdigest())
+            os.makedirs(latent_dir, exist_ok=True)
+            latent_path = os.path.join(
+                latent_dir,
+                os.path.splitext(image_path_filename)[0] + '.pt')
+            if os.path.exists(latent_path):
+                self.latents_cache[image_path] = torch.load(latent_path)
             else:
-                input_ids = self.tokenizer(caption, padding='max_length', truncation=True,
-                                           add_special_tokens=auto_add_special_tokens,
-                                           return_tensors='pt').input_ids
-                uncond_input_ids = self.tokenizer(negative_caption, padding='max_length', truncation=True,
-                                                    add_special_tokens=auto_add_special_tokens,
-                                                    return_tensors='pt').input_ids
-            if not self.shuffle_tags:
-                self.caption_cache[image_path] = {'input_ids': input_ids, 
-                                                  'uncond_input_ids': uncond_input_ids,
-                                                  'prompt': caption,
-                                                  'negative_prompt': negative_caption}
-        return caption, {'input_ids': input_ids, 
-                         'uncond_input_ids': uncond_input_ids, 
-                         'prompt': caption,
-                         'negative_prompt': negative_caption}
+                image = open_and_trim(image_path, res, False)
+                img_tensor = self.image_transforms(image)
+                img_tensor = img_tensor.unsqueeze(0).to(device=self.vae.device, dtype=self.vae.dtype)
+                latents = self.vae.encode(img_tensor).latent_dist.sample().squeeze(0).to("cpu")
+                self.latents_cache[image_path] = latents
+
+                tmp_latent_path = latent_path\
+                    + '.%08x.tmp' % threading.get_ident()
+                torch.save(latents, tmp_latent_path)
+                try:
+                    os.rename(tmp_latent_path, latent_path)
+                except (FileExistsError, PermissionError):
+                    os.remove(tmp_latent_path)
 
     def make_buckets_with_caching(self, vae):
         self.vae = vae
@@ -173,43 +162,36 @@ class DbDataset(torch.utils.data.Dataset):
             for prompt_data in img_data:
                 path = prompt_data.src_image
                 image_width, image_height = prompt_data.resolution
-                cap = prompt_data.prompt
                 reso = closest_resolution(image_width, image_height, resos)
                 concept_idx = prompt_data.concept_index
                 # Append the concept index to the resolution, and boom, we got ourselves split concepts.
                 di = (*reso, concept_idx)
-                target_dict.setdefault(di, []).append((path, cap, is_class_img))
+                target_dict.setdefault(di, []).append(
+                    (path, is_class_img, prompt_data))
 
         sort_images(self.train_img_data, bucket_resos, self.train_dict, False)
         sort_images(self.class_img_data, bucket_resos, self.class_dict, True)
 
         def cache_images(images, reso, p_bar):
-            for img_path, cap, is_prior in images:
+            shuffled_images = images
+            random.shuffle(shuffled_images)
+            for img_path, is_prior, prompt_data in shuffled_images:
                 try:
-                    # If the image is not in the "precache",cache it
-                    if img_path not in latents_cache:
-                        if self.cache_latents and not self.debug_dataset:
-                            self.cache_latent(img_path, reso)
-                    # Otherwise, load it from existing cache
-                    else:
-                        self.latents_cache[img_path] = latents_cache[img_path]
-                    if not self.shuffle_tags:
-                        self.cache_caption(img_path, cap)
+                    if self.cache_latents and not self.debug_dataset:
+                        self.cache_latent(img_path, reso)
                     self.sample_indices.append(img_path)
-                    self.sample_cache.append((img_path, cap, is_prior))
+                    self.sample_cache.append(
+                        (img_path, is_prior, prompt_data))
                     p_bar.update()
                 except Exception as e:
                     traceback.print_exc()
                     print(f"Exception caching: {img_path}: {e}")
-                    if img_path in self.caption_cache:
-                        del self.caption_cache[img_path]
-                    if (img_path, cap, is_prior) in self.sample_cache:
-                        del self.sample_cache[(img_path, cap, is_prior)]
+                    if (img_path, is_prior, prompt_data) in self.sample_cache:
+                        del self.sample_cache[(img_path, is_prior, prompt_data)]
                     if img_path in self.sample_indices:
                         del self.sample_indices[img_path]
                     if img_path in self.latents_cache:
                         del self.latents_cache[img_path]
-            self.latents_cache.update(latents_cache)
 
         bucket_idx = 0
         total_len = 0
@@ -224,11 +206,6 @@ class DbDataset(torch.utils.data.Dataset):
         total_instances = 0
         total_classes = 0
         pbar = mytqdm(range(p_len), desc="Caching latents..." if self.cache_latents else "Processing images...", position=0)
-        image_cache_file = os.path.join(self.cache_dir, f"image_cache_{self.resolution}.safetensors")
-        latents_cache = {}
-        if os.path.exists(image_cache_file):
-            print("Loading cached latents...")
-            latents_cache = safetensors.torch.load_file(image_cache_file)
         for dict_idx, train_images in self.train_dict.items():
             if not train_images:
                 continue
@@ -248,7 +225,7 @@ class DbDataset(torch.utils.data.Dataset):
                 class_count = len(class_images)
             total_instances += inst_count
             total_classes += class_count
-            example_len = inst_count if class_count == 0 else inst_count * 2
+            example_len = inst_count + class_count
             # Use index here, not res
             bucket_len[dict_idx] = example_len
             total_len += example_len
@@ -260,15 +237,6 @@ class DbDataset(torch.utils.data.Dataset):
             pbar.write(
                 f"Bucket {bucket_str} {dict_idx} - Instance Images: {inst_str} | Class Images: {class_str} | Max Examples/batch: {ex_str}")
             bucket_idx += 1
-        try:
-            if set(self.latents_cache.keys()) != set(latents_cache.keys()):
-                print("Saving cache!")
-                del latents_cache
-                if os.path.exists(image_cache_file):
-                    os.remove(image_cache_file)
-                safetensors.torch.save_file(copy.deepcopy(self.latents_cache), image_cache_file)
-        except:
-            pass
         bucket_str = str(bucket_idx).rjust(max_idx_chars, " ")
         inst_str = str(total_instances).rjust(len(str(ni)), " ")
         class_str = str(total_classes).rjust(len(str(nc)), " ")
@@ -320,7 +288,7 @@ class DbDataset(torch.utils.data.Dataset):
 
         repeats = 0
         # Grab instance image data
-        image_path, caption, is_class_image = bucket[img_index]
+        image_path, is_class_image, prompt_data = bucket[img_index]
         image_index = self.sample_indices.index(image_path)
 
         img_index += 1
@@ -335,24 +303,16 @@ class DbDataset(torch.utils.data.Dataset):
         return image_index, repeats
 
     def __getitem__(self, index):
-        image_path, caption, is_class_image = self.sample_cache[index]
-        if not self.debug_dataset:
-            image_data, parameters = self.load_image(image_path, caption, self.active_resolution)
-        else:
-            # TODO: not work
-            image_data = image_path
-            # print(f"Recoding: {caption}")
-            caption, cap_tokens = self.cache_caption(image_path, caption)
-            rebuilt = self.tokenizer.decode(cap_tokens.tolist()[0])
-            input_ids = (caption, rebuilt)
-            parameters = {'input_ids': input_ids}
+        image_path, is_class_image, prompt_data = self.sample_cache[index]
+        image_data = self.load_image(image_path, self.active_resolution)
         # If we have reached the end of our bucket, increment to the next, update the count, reset image index.
+
+        #prompt = drop_quality_tag(parameters["prompt"]) 
         example = {
             "image": image_data,
-            "input_ids": parameters['input_ids'],
-            "uncond_input_ids": parameters['uncond_input_ids'],
-            "prompt": parameters['prompt'],
-            "negative_prompt": parameters['negative_prompt'],
+            "prompt": prompt_data.prompt,
+            "negative_prompt": prompt_data.negative_prompt,
+            "guidance_scale": prompt_data.scale,
             "res": self.active_resolution,
             "is_class": is_class_image
         }

@@ -5,7 +5,7 @@ from PIL import Image
 
 from dreambooth.dataclasses.db_config import DreamboothConfig
 from dreambooth.dataclasses.prompt_data import PromptData
-from dreambooth.utils.image_utils import get_images, FilenameTextGetter, \
+from dreambooth.utils.image_utils import get_images, \
     closest_resolution, make_bucket_resolutions
 
 

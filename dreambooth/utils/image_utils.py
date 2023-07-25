@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import random
@@ -104,7 +105,7 @@ def is_image(path: str, feats=None):
 
 def sort_prompts(
         concept: Concept,
-        text_getter: FilenameTextGetter,
+        json_getter: FilenameJsonGetter,
         img_dir: str,
         images: List[str],
         bucket_resos: List[Tuple[int, int]],
@@ -125,13 +126,13 @@ def sort_prompts(
         # Get prompt
         pbar.set_description(f"Pre-processing images: {dirr}")
 
-        file_text = text_getter.read_text(img)
+        file_parameters = json_getter.read_text(img)
         if verbatim:
-            prompt = file_text
+            parameters = file_parameters
         else:
-            prompt = text_getter.create_text(
+            parameters = json_getter.create_text(
                 concept.class_prompt if is_class else concept.instance_prompt,
-                file_text,
+                file_parameters,
                 concept,
                 is_class
             )
@@ -140,11 +141,13 @@ def sort_prompts(
         reso = closest_resolution(w, h, bucket_resos)
         prompt_list = prompts[reso] if reso in prompts else []
         pd = PromptData(
-            prompt=prompt,
-            negative_prompt=concept.class_negative_prompt if is_class else None,
+            prompt=parameters[FilenameJsonGetter.CAPTION_KEY],
+            negative_prompt=parameters['Negative prompt'],
             instance_token=concept.instance_token,
             class_token=concept.class_token,
             src_image=img,
+            steps=int(parameters['Steps']),
+            scale=float(parameters['CFG scale']),
             resolution=reso,
             concept_index=concept_index
         )
@@ -154,36 +157,30 @@ def sort_prompts(
     return dict(sorted(prompts.items()))
 
 
-class FilenameTextGetter:
-    """Adapted from modules.textual_inversion.dataset.PersonalizedBase to get caption for image."""
+class FilenameJsonGetter:
+    CAPTION_KEY = 'TrainingTags'
 
     re_numbers_at_start = re.compile(r"^[-\d]+\s*")
 
     def __init__(self, shuffle_tags=False):
-        self.re_word = re.compile(shared.dataset_filename_word_regex) if len(
-            shared.dataset_filename_word_regex) > 0 else None
-        self.shuffle_tags = shuffle_tags
+        # ignore
+        _ = shuffle_tags
 
     def read_text(self, img_path):
-        text_filename = os.path.splitext(img_path)[0] + ".txt"
-        filename = os.path.basename(img_path)
+        img_dir, img_filename = os.path.split(img_path)
+        json_filepath = os.path.join(
+            img_dir, 'parameters',
+            os.path.splitext(img_filename)[0] + '.json')
 
-        if os.path.exists(text_filename):
-            with open(text_filename, "r", encoding="utf8") as file:
-                filename_text = file.read().strip()
-        else:
-            filename_text = os.path.splitext(filename)[0]
-            filename_text = re.sub(self.re_numbers_at_start, '', filename_text)
-            if self.re_word:
-                tokens = self.re_word.findall(filename_text)
-                filename_text = (shared.dataset_filename_join_string or "").join(tokens)
+        assert os.path.exists(json_filepath)
+        with open(json_filepath, "r", encoding="utf-8") as file:
+            parameters = json.load(file)
+        return parameters
 
-        return filename_text
-
-    def create_text(self, prompt, file_text, concept, is_class=True):
+    def create_text(self, prompt, parameters, concept, is_class=True):
         instance_token = concept.instance_token
         class_token = concept.class_token
-        output = prompt.replace("[filewords]", file_text)
+        output = prompt.replace("[filewords]", parameters[self.CAPTION_KEY])
 
         if instance_token and class_token:
             instance_regex = re.compile(f"\\b{instance_token}\\b", flags=re.IGNORECASE)
@@ -229,12 +226,10 @@ class FilenameTextGetter:
         output = re.sub(r"\s+", " ", output)
         output = re.sub(r"\\", "", output)
 
-        if self.shuffle_tags:
-            output = shuffle_tags(output)
-        else:
-            output = output.strip()
+        output = output.strip()
 
-        return output
+        parameters[self.CAPTION_KEY] = output
+        return parameters
 
 
 def shuffle_tags(caption: str):

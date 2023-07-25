@@ -1,7 +1,7 @@
 import json
 import os
 import traceback
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from pydantic import BaseModel
 
@@ -45,7 +45,13 @@ class DreamboothConfig(BaseModel):
     gradient_checkpointing: bool = True
     gradient_set_to_none: bool = True
     graph_smoothing: int = 50
+    guidance_scale: Optional[float] = None
+    guidance_scale_init: float = 1.0
+    guidance_scale_scheduled_steps: Optional[int] = None
     half_model: bool = False
+    instance_loss_weight: float = 1.0
+    is_loss_count_scale: bool = False
+    is_use_emphasis: bool = True
     train_unfrozen: bool = True
     has_ema: bool = False
     hflip: bool = False
@@ -72,6 +78,9 @@ class DreamboothConfig(BaseModel):
     model_name: str = ""
     model_dir: str = ""
     model_path: str = ""
+    noise_pred_target_method: str = 'noise'
+    noise_pred_method: str = ''
+    loss_function_method: str = 'mse'
     num_train_epochs: int = 100
     offset_noise: float = 0
     optimizer: str = "8bit AdamW"

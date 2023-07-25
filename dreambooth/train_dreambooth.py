@@ -6,6 +6,8 @@ import itertools
 import logging
 import math
 import os
+import random
+import re
 import time
 import traceback
 from decimal import Decimal
@@ -64,6 +66,8 @@ from lora_diffusion.lora import (
     TEXT_ENCODER_DEFAULT_TARGET_REPLACE,
     get_target_module,
 )
+
+from image_preprocess_utils import QualityTagExtracter
 
 logger = logging.getLogger(__name__)
 # define a Handler which writes DEBUG messages or higher to the sys.stderr
@@ -145,7 +149,7 @@ def stop_profiler(profiler):
             pass
 
 
-def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
+def main(guidance_scale, noise_pred_target_method, class_gen_method: str = "Native Diffusers") -> TrainResult:
     """
     @param class_gen_method: Image Generation Library.
     @return: TrainResult
@@ -286,6 +290,14 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
         )
         unet = torch2ify(unet)
 
+        unet_reference = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="unet",
+            revision=args.revision,
+            torch_dtype=torch.float32,
+        )
+        unet_reference = torch2ify(unet_reference)
+
         # Check that all trainable models are in full precision
         low_precision_error_string = (
             "Please make sure to always have all model weights in full float32 precision when starting training - even if"
@@ -305,11 +317,16 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                     "xformers is not available. Make sure it is installed correctly"
                 )
             xformerify(unet)
+            xformerify(unet_reference)
             xformerify(vae)
 
         if accelerator.unwrap_model(unet).dtype != torch.float32:
             print(
                 f"Unet loaded as datatype {accelerator.unwrap_model(unet).dtype}. {low_precision_error_string}"
+            )
+        if accelerator.unwrap_model(unet_reference).dtype != torch.float32:
+            print(
+                f"Unet Reference loaded as datatype {accelerator.unwrap_model(unet_reference).dtype}. {low_precision_error_string}"
             )
 
         if (
@@ -374,6 +391,7 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
 
         if args.use_lora or not args.train_unet:
             unet.requires_grad_(False)
+        unet_reference.requires_grad_(False)
 
         unet_lora_params = None
         text_encoder_lora_params = None
@@ -443,6 +461,8 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
             try:
                 if unet:
                     del unet
+                if unet_reference:
+                    del unet_reference
                 if text_encoder:
                     del text_encoder
                 if tokenizer:
@@ -511,6 +531,14 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
         def collate_fn(examples):
             input_ids = [example["input_ids"] for example in examples]
             uncond_input_ids = [example["uncond_input_ids"] for example in examples]
+
+            def drop_quality_tag(prompt):
+                quality_tag_prompt, removed_prompt =\
+                    QualityTagExtracter.extract(prompt, is_drop=True)
+                return removed_prompt + ', ' + quality_tag_prompt
+            prompts = [drop_quality_tag(example["prompt"]) 
+                       for example in examples]
+            negative_prompts = [example["negative_prompt"] for example in examples]
             pixel_values = [example["image"] for example in examples]
             types = [example["is_class"] for example in examples]
             weights = [
@@ -532,6 +560,8 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
             batch_data = {
                 "input_ids": input_ids,
                 "uncond_input_ids": uncond_input_ids,
+                "prompt": prompts,
+                "negative_prompt": negative_prompts,
                 "images": pixel_values,
                 "types": types,
                 "loss_avg": loss_avg,
@@ -577,6 +607,7 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                 (
                     ema_model.model,
                     unet,
+                    unet_reference,
                     text_encoder,
                     optimizer,
                     train_dataloader,
@@ -584,6 +615,7 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                 ) = accelerator.prepare(
                     ema_model.model,
                     unet,
+                    unet_reference,
                     text_encoder,
                     optimizer,
                     train_dataloader,
@@ -593,26 +625,37 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                 (
                     ema_model.model,
                     unet,
+                    unet_reference,
                     optimizer,
                     train_dataloader,
                     lr_scheduler,
                 ) = accelerator.prepare(
-                    ema_model.model, unet, optimizer, train_dataloader, lr_scheduler
+                    ema_model.model, 
+                    unet, 
+                    unet_reference,
+                    optimizer, train_dataloader, lr_scheduler
                 )
         else:
             if stop_text_percentage != 0:
                 (
                     unet,
+                    unet_reference,
                     text_encoder,
                     optimizer,
                     train_dataloader,
                     lr_scheduler,
                 ) = accelerator.prepare(
-                    unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+                    unet, 
+                    unet_reference,
+                    text_encoder, optimizer, train_dataloader, lr_scheduler
                 )
             else:
-                unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                    unet, optimizer, train_dataloader, lr_scheduler
+                unet, 
+                unet_reference,
+                optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    unet, 
+                    unet_reference,
+                    optimizer, train_dataloader, lr_scheduler
                 )
 
         if not args.cache_latents and vae is not None:
@@ -1147,9 +1190,21 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                     noisy_latents_input = torch.cat([noisy_latents] * 2)
                     pad_tokens = args.pad_tokens if train_tenc else False
+
+                    def tokenize(caption):
+                        # strict_tokens:False -> add_special_tokens=True
+                        return tokenizer(caption, padding='max_length',
+                                         truncation=True,
+                                         add_special_tokens=True,
+                                         return_tensors='pt').input_ids
+                    input_ids = [tokenize(caption) for caption in batch['prompt']]
+                    input_ids = torch.cat(input_ids, dim=0)
+                    uncond_input_ids = [tokenize(caption) for caption in batch['negative_prompt']]
+                    uncond_input_ids = torch.cat(uncond_input_ids, dim=0)
+
                     encoder_hidden_states = encode_hidden_state(
                         text_encoder,
-                        batch["input_ids"],
+                        input_ids.to(accelerator.device),
                         pad_tokens,
                         b_size,
                         args.max_token_length,
@@ -1158,7 +1213,7 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                     )
                     uncond_encoder_hidden_states = encode_hidden_state(
                         text_encoder,
-                        batch["uncond_input_ids"],
+                        uncond_input_ids.to(accelerator.device),
                         pad_tokens,
                         b_size,
                         args.max_token_length,
@@ -1176,20 +1231,43 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                             encoder_hidden_states_input
                         ).sample
                     else:
+                        with torch.no_grad():
+                            noise_pred_output_reference = unet_reference(
+                                noisy_latents_input, timesteps_input, 
+                                encoder_hidden_states_input
+                            ).sample
                         noise_pred_output = unet(
                             noisy_latents_input, timesteps_input, 
                             encoder_hidden_states_input
                         ).sample
 
-                    guidance_scale = 7.0
                     noise_pred_uncond, noise_pred_text = noise_pred_output.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    with torch.no_grad():
+                        noise_pred_uncond_reference, noise_pred_text_reference = noise_pred_output_reference.chunk(2)
+                        noise_pred_reference = noise_pred_uncond_reference + guidance_scale * (noise_pred_text_reference - noise_pred_uncond_reference)
+                        noise_pred_reference_norms = torch.linalg.norm(
+                            torch.linalg.norm(noise_pred_reference, dim=(2, 3)), dim=1)
+                        noise_norms = torch.linalg.norm(
+                            torch.linalg.norm(noise, dim=(2, 3)), dim=1)
+                        noise_gains = noise_pred_reference_norms / noise_norms
+                        noise_gains = noise_gains.reshape(
+                            (*noise_gains.shape, 1, 1, 1)).expand(
+                            noise_pred_reference.shape)
+
+
 
                     # Get the target for loss depending on the prediction type
                     if noise_scheduler.config.prediction_type == "v_prediction":
                         target = noise_scheduler.get_velocity(latents, noise, timesteps)
                     else:
-                        target = noise
+                        if noise_pred_target_method == 'noise_gain':
+                            target = noise * noise_gains
+                        elif noise_pred_target_method == 'uncond_reference':
+                            with torch.no_grad():
+                                target = noise_pred_uncond_reference + guidance_scale * (noise - noise_pred_uncond_reference)
+                        elif noise_pred_target_method == 'uncond_reference2':
+                            target = noise_pred_uncond + guidance_scale * (noise - noise_pred_uncond_reference)
 
                     if not args.split_loss:
                         loss = instance_loss = torch.nn.functional.mse_loss(
@@ -1275,6 +1353,13 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                 del noise_pred_output
                 del noise_pred_text
                 del noise_pred_uncond
+                del noise_pred_reference
+                del noise_pred_output_reference
+                del noise_pred_text_reference
+                del noise_pred_uncond_reference
+                del noise_pred_reference_norms
+                del noise_norms
+                del noise_gains
                 del latents
                 del encoder_hidden_states
                 del uncond_encoder_hidden_states

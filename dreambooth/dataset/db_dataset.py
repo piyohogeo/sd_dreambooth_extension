@@ -125,7 +125,7 @@ class DbDataset(torch.utils.data.Dataset):
             latents = self.vae.encode(img_tensor).latent_dist.sample().squeeze(0).to("cpu")
             self.latents_cache[image_path] = latents
 
-    def cache_caption(self, image_path, caption, negative_caption=''):
+    def cache_caption(self, image_path, caption, negative_caption='EasyNegative, bad-hands-5, bad hands, poorly drawn hands, mutated hands, extra fingers, missing fingers, ugly fingers, melted fingers, (worst quality:2.0), (low quality:2.0), normal quality, blurry, bad anatomy, bad-artist, poor colors, low quality clothes, 3D, CG, less details'):
         input_ids = None
         uncond_input_ids = None
         auto_add_special_tokens = False if self.strict_tokens else True
@@ -149,8 +149,14 @@ class DbDataset(torch.utils.data.Dataset):
                                                     add_special_tokens=auto_add_special_tokens,
                                                     return_tensors='pt').input_ids
             if not self.shuffle_tags:
-                self.caption_cache[image_path] = {'input_ids': input_ids, 'uncond_input_ids': uncond_input_ids}
-        return caption, {'input_ids': input_ids, 'uncond_input_ids': uncond_input_ids}
+                self.caption_cache[image_path] = {'input_ids': input_ids, 
+                                                  'uncond_input_ids': uncond_input_ids,
+                                                  'prompt': caption,
+                                                  'negative_prompt': negative_caption}
+        return caption, {'input_ids': input_ids, 
+                         'uncond_input_ids': uncond_input_ids, 
+                         'prompt': caption,
+                         'negative_prompt': negative_caption}
 
     def make_buckets_with_caching(self, vae):
         self.vae = vae
@@ -345,6 +351,8 @@ class DbDataset(torch.utils.data.Dataset):
             "image": image_data,
             "input_ids": parameters['input_ids'],
             "uncond_input_ids": parameters['uncond_input_ids'],
+            "prompt": parameters['prompt'],
+            "negative_prompt": parameters['negative_prompt'],
             "res": self.active_resolution,
             "is_class": is_class_image
         }

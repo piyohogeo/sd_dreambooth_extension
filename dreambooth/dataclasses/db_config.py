@@ -114,6 +114,7 @@ class DreamboothConfig(BaseModel):
     save_lora_during: bool = True
     save_lora_for_extra_net: bool = True
     save_preview_every: int = 5
+    save_prior_grad: bool = False
     save_safetensors: bool = True
     save_state_after: bool = False
     save_state_cancel: bool = False
@@ -122,6 +123,7 @@ class DreamboothConfig(BaseModel):
     shuffle_tags: bool = True
     snapshot: str = ""
     split_loss: bool = True
+    split_optimizer: bool = False
     src: str = ""
     stop_text_encoder: float = 1.0
     strict_tokens: bool = False

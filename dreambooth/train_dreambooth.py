@@ -2,7 +2,7 @@
 # https://github.com/ShivamShrirao/diffusers/tree/main/examples/dreambooth
 # With some custom bits sprinkled in and some stuff from OG diffusers as well.
 
-import copy
+import contextlib
 import io
 import gc
 import itertools
@@ -78,6 +78,10 @@ from lora_diffusion.lora import (
 
 from prompt_utils import build_embed_from_prompt
 from kimuraya.image_preprocess_utils import QualityTagExtracter
+from kimuraya.stable_diffusion.model_utils import (
+    load_lora_unet,
+    load_lora_text_encoder,
+    load_from_safetensor)
 
 logger = logging.getLogger(__name__)
 # define a Handler which writes DEBUG messages or higher to the sys.stderr
@@ -462,7 +466,7 @@ def main(null_guidance_scale=0.0,
         lora_txt = None
 
         if args.use_lora:
-            if args.lora_model_name:
+            if args.lora_model_name and '.pt' in args.lora_model_name:
                 lora_path = os.path.join(args.model_dir, "loras", args.lora_model_name)
                 lora_txt = lora_path.replace(".pt", "_txt.pt")
 
@@ -480,6 +484,13 @@ def main(null_guidance_scale=0.0,
                 target_replace_module=target_module,
             )
 
+            def flatten_parameters(ps):
+                if isinstance(ps, torch.nn.parameter.Parameter):
+                    return [ps]
+                else:
+                    return sum([flatten_parameters(p) for p in ps], [])
+            unet_lora_params = flatten_parameters(unet_lora_params)
+
             text_encoder.requires_grad_(False)
             if stop_text_percentage != 0:
                 inject_trainable_txt_lora = get_target_module("injection", False)
@@ -489,6 +500,16 @@ def main(null_guidance_scale=0.0,
                     r=args.lora_txt_rank,
                     loras=lora_txt,
                 )
+                text_encoder_lora_params = flatten_parameters(text_encoder_lora_params)
+
+            def load_lora_weights():
+                lora_tensors = load_from_safetensor(args.lora_model_name)
+                load_lora_unet(unet, lora_tensors)
+                load_lora_text_encoder(text_encoder, lora_tensors)
+
+            if args.lora_model_name and '.safetensors' in args.lora_model_name:
+                load_lora_weights()
+
             printm("Lora loaded")
             cleanup()
             printm("Cleaned")
@@ -507,29 +528,36 @@ def main(null_guidance_scale=0.0,
                 print('-> lora_txt_learning_rate: ', args.lora_txt_learning_rate)
 
             args.learning_rate = args.lora_learning_rate
-            if stop_text_percentage != 0:
-                params_to_optimize = [
-                    {
-                        "params": itertools.chain(*unet_lora_params),
-                        "lr": args.lora_learning_rate,
-                    },
-                    {
-                        "params": itertools.chain(*text_encoder_lora_params),
-                        "lr": args.lora_txt_learning_rate,
-                    },
-                ]
-            else:
-                params_to_optimize = itertools.chain(*unet_lora_params)
 
-        elif stop_text_percentage != 0:
-            if args.train_unet:
-                params_to_optimize = itertools.chain(unet.parameters(), text_encoder.parameters())
+        def build_params_to_optimize():
+            if args.use_lora:
+                if stop_text_percentage != 0:
+                    params_to_optimize = [
+                        {
+                            "params": unet_lora_params,
+                            "lr": args.lora_learning_rate,
+                        },
+                        {
+                            "params": text_encoder_lora_params,
+                            "lr": args.lora_txt_learning_rate,
+                        },
+                    ]
+                else:
+                    params_to_optimize = unet_lora_params
+            elif stop_text_percentage != 0:
+                if args.train_unet:
+                    params_to_optimize = itertools.chain(unet.parameters(), text_encoder.parameters())
+                else:
+                    params_to_optimize = itertools.chain(text_encoder.parameters())
             else:
-                params_to_optimize = itertools.chain(text_encoder.parameters())
-        else:
-            params_to_optimize = unet.parameters()
+                params_to_optimize = unet.parameters()
+            return params_to_optimize
 
-        optimizer = get_optimizer(args, params_to_optimize)
+        optimizer = get_optimizer(args, build_params_to_optimize())
+        is_instance_accumulate = None
+        if args.split_optimizer:
+            instance_optimizer = get_optimizer(args, build_params_to_optimize())
+
 
         noise_scheduler = get_noise_scheduler(args)
 
@@ -570,13 +598,29 @@ def main(null_guidance_scale=0.0,
             vae.eval()
         printm("Loading dataset...")
         random.seed(accelerator.process_index)
+
+        if args.split_optimizer:
+            dataset_interleave_size = (train_batch_size
+                                       * accelerator.num_processes
+                                       * gradient_accumulation_steps)
+        elif args.dataset_mix_split_size > 1:
+            dataset_interleave_size = args.dataset_mix_split_size
+        elif gradient_accumulation_steps % 2 == 0:
+            dataset_interleave_size = (train_batch_size
+                                       * accelerator.num_processes
+                                       * gradient_accumulation_steps
+                                       // 2)
+        else:
+            dataset_interleave_size = 1
+        print('dataset_interleave_size:', dataset_interleave_size)
+
         train_dataset, train_sampler = build_resolution_dataset_and_sampler(
             args=args,
             instance_prompts=instance_prompts,
             class_prompts=class_prompts,
             batch_size=train_batch_size,
             vae=vae if args.cache_latents else None,
-            split_size=args.dataset_mix_split_size
+            interleave_size=dataset_interleave_size
         )
 
         printm("Dataset loaded.")
@@ -680,6 +724,8 @@ def main(null_guidance_scale=0.0,
             to_prepare_objects.append(text_encoder)
         if is_use_ref:
             to_prepare_objects.append(unet_reference)
+        if args.split_optimizer:
+            to_prepare_objects.append(instance_optimizer)
 
         prepared_objects = accelerator.prepare(*to_prepare_objects)
 
@@ -690,6 +736,8 @@ def main(null_guidance_scale=0.0,
             text_encoder, *rs = rs
         if is_use_ref:
             unet_reference, *rs = rs
+        if args.split_optimizer:
+            instance_optimizer, *rs = rs
         assert rs == []
         del to_prepare_objects
         del prepared_objects
@@ -1098,10 +1146,7 @@ def main(null_guidance_scale=0.0,
                         (2024, 2024), device='cpu')).to(
                         accelerator.device)
 
-        instance_losses = []
-        instance_loss_mean = torch.tensor(1.0)
-        prior_losses = []
-        prior_loss_mean = torch.tensor(1.0)
+        prior_grads = []
         for epoch in range(first_epoch, max_train_epochs):
             if training_complete:
                 print("Training complete, breaking epoch.")
@@ -1141,6 +1186,7 @@ def main(null_guidance_scale=0.0,
             random_seed = int(accelerate.utils.broadcast(
                 torch.tensor(random_seed)))
             random.seed(random_seed)
+
             for step, batch in enumerate(train_dataloader):
                 # Skip steps until we reach the resumed step
                 if (
@@ -1153,7 +1199,10 @@ def main(null_guidance_scale=0.0,
                     status.job_count = max_train_steps
                     status.job_no += total_batch_size
                     continue
-                with accelerator.accumulate(unet), accelerator.accumulate(text_encoder):
+                with (accelerator.accumulate(unet),
+                      (accelerator.no_sync(text_encoder)
+                       if not accelerator.sync_gradients
+                       else contextlib.nullcontext())):
                     # Convert images to latent space
                     if args.cache_latents:
                         latents = batch["images"].to(accelerator.device)
@@ -1456,7 +1505,6 @@ def main(null_guidance_scale=0.0,
                             return p * torch.nn.functional.mse_loss(
                                 xs.float(), ys.float(), reduction="mean"
                             )
-                            assert False
                         batched_loss = torch.stack([loss_fun_batch(x, y, p) for x, y, p in zip(xs, ys, prod)])
                         assert batched_loss.shape[0] == xs.shape[0]
                         assert batched_loss.shape[0] == ys.shape[0]
@@ -1503,13 +1551,17 @@ def main(null_guidance_scale=0.0,
                                 prior_noise_chunks.append(noise_chunks[i])
 
                         # initialize with 0 in case we are having batch = 1
-                        instance_loss = torch.tensor(0)
-                        prior_loss = torch.tensor(0)
-                        instance_text_loss = torch.tensor(0)
-                        prior_text_loss = torch.tensor(0)
+                        instance_loss = torch.tensor(0.0)
+                        prior_loss = torch.tensor(0.0)
+                        instance_text_loss = torch.tensor(0.0)
+                        prior_text_loss = torch.tensor(0.0)
 
                         assert pred.shape[0] == b_size
                         assert target.shape[0] == b_size
+                        if dataset_interleave_size >= b_size:
+                            assert len(instance_chunks) == 0 or len(prior_pred_chunks) == 0
+                        else:
+                            assert len(instance_chunks) == len(prior_pred_chunks)
                         # Concatenate the chunks in instance_chunks to form the model_pred_instance tensor
                         if len(instance_chunks):
                             model_pred = torch.stack(instance_chunks, dim=0).float()
@@ -1556,23 +1608,8 @@ def main(null_guidance_scale=0.0,
                                 )
                                 prior_loss += prior_text_loss
 
-                        instance_losses.append(instance_loss.detach().cpu())
-                        instance_losses = instance_losses[-args.mean_batch_count:]
-                        instance_loss_mean = torch.mean(
-                            torch.stack(instance_losses))
-                        prior_losses.append(prior_loss.detach().cpu())
-                        prior_losses = prior_losses[-args.mean_batch_count:]
-                        prior_loss_mean = torch.mean(
-                            torch.stack(prior_losses))
+                        instance_loss_weight = args.instance_loss_weight
 
-                        if 'instance_normalize' in args.loss_function_method:
-                            instance_loss_weight = (args.instance_loss_weight
-                                                    * float(prior_loss_mean.item())
-                                                    / float(instance_loss_mean.item()))
-                        else:
-                            instance_loss_weight = args.instance_loss_weight
-
-                        assert len(instance_chunks) == len(prior_chunks)
                         if len(instance_chunks) and len(prior_chunks):
                             # Add the prior loss to the instance loss.
                             loss = (instance_loss_weight * instance_loss
@@ -1590,11 +1627,11 @@ def main(null_guidance_scale=0.0,
                                       args.l2_regularization_lambda)
                             parameters = itertools.chain(
                                 *(p['params'] for p in optimizer.param_groups))
-                            param_l2_norm = sum([torch.linalg.norm(p)
+                            param_l2_norm2 = sum([torch.sum(p.pow(2.0))
                                                  for p in parameters
                                                  if p.requires_grad])
                             loss += (args.l2_regularization_lambda
-                                     * param_l2_norm)
+                                     * param_l2_norm2)
 
                     accelerator.backward(loss)
 
@@ -1603,7 +1640,9 @@ def main(null_guidance_scale=0.0,
                             params_to_clip = itertools.chain(
                                 *(p['params'] for p in optimizer.param_groups))
                             cliped_grad_norm = accelerator.clip_grad_norm_(
-                                params_to_clip, args.clip_grad_norm)
+                                params_to_clip,
+                                args.clip_grad_norm
+                                * np.abs(args.instance_loss_weight))
                         else:
                             if train_tenc:
                                 params_to_clip = itertools.chain(
@@ -1613,28 +1652,87 @@ def main(null_guidance_scale=0.0,
                             cliped_grad_norm = accelerator.clip_grad_norm_(
                                 params_to_clip, args.clip_grad_norm_global)
                     else:
-                        cliped_grad_norm= None
+                        cliped_grad_norm = None
 
-
-                    if (accelerator.sync_gradients and
-                            (global_step // total_batch_size) % 100 == 0):
-                        def flatten_parameters():
-                            parameters = itertools.chain(*[p['params'] for p in optimizer.param_groups])
-                            parameters = [p for p in parameters if p.requires_grad and p.grad is not None]
-                            datas = torch.cat([torch.flatten(p.data).detach().cpu() for p in parameters])
-                            grads = torch.cat([torch.flatten(p.grad).detach().cpu() for p in parameters])
-                            return (datas, grads)
-                        param_to_optimize_datas, param_to_optimize_grads = flatten_parameters()
+                    if accelerator.sync_gradients and args.split_optimizer:
+                        def collect_params():
+                            parameters = itertools.chain(*(p['params'] for p in optimizer.param_groups))
+                            params = [p for p in parameters if p.requires_grad and p.grad is not None]
+                            grads = [p.grad for p in params]
+                            if accelerator.is_main_process and args.split_optimizer:
+                                return ([p.cpu() for p in params], grads)
+                            else:
+                                return (None, grads)
+                        params, param_grads = collect_params()
                     else:
-                        param_to_optimize_datas, param_to_optimize_grads = None, None
+                        params, param_grads = None, None
 
-                    optimizer.step()
+                    @torch.no_grad()
+                    def try_copy(src_ts, dst_ts):
+                        if dst_ts is None or len(dst_ts) == 0:
+                            dst_ts = [t.detach().clone() for t in src_ts]
+                        else:
+                            for src_t, dst_t in zip(src_ts, dst_ts):
+                                dst_t.copy_(src_t)
+                        return dst_ts
+                    # wrapped .step() is called if sync_gradients
+                    grads_dot = None
+                    if accelerator.sync_gradients:
+                        if args.split_optimizer:
+                            @torch.no_grad()
+                            def dot_all_tensors(xs, ys):
+                                return sum([torch.sum(x * y) for x, y in zip(xs, ys)])
+
+                            @torch.no_grad()
+                            def norm_all_tensors(xs):
+                                return torch.sqrt(dot_all_tensors(xs, xs))
+
+                            @torch.no_grad()
+                            def offset_scaled_(dst_ts, src_ts, scale):
+                                for d, s in zip(dst_ts, src_ts):
+                                    new_d = d + s * scale
+                                    d.copy_(new_d)
+
+                            if len(instance_chunks):
+                                if len(param_grads) > 0 and len(prior_grads) > 0:
+                                    if accelerator.is_main_process:
+                                        params_filename = f'instance_params_{epoch}_{step}.pt'
+                                        with torch.no_grad():
+                                            torch.save(params,
+                                                       os.path.join(args.model_dir,
+                                                                    'logging',
+                                                                    params_filename))
+                                    with torch.no_grad():
+                                        grads_dot = dot_all_tensors(param_grads, prior_grads)
+                                        param_grads_norm = norm_all_tensors(param_grads)
+                                        prior_grads_norm = norm_all_tensors(prior_grads)
+                                        grads_cos = grads_dot / (param_grads_norm * prior_grads_norm)
+                                        offset_coef = -grads_cos * param_grads_norm / prior_grads_norm
+                                        offset_scaled_(param_grads, prior_grads, offset_coef)
+                                        offseted_param_grads_norm = norm_all_tensors(param_grads)
+                                        offseted_grads_dot = dot_all_tensors(param_grads, prior_grads)
+
+                                instance_optimizer.step()
+                            else:
+                                optimizer.step()
+                                prior_grads = try_copy(param_grads, prior_grads)
+                                if accelerator.is_main_process:
+                                    params_filename = f'prior_params_{epoch}_{step}.pt'
+                                    with torch.no_grad():
+                                        torch.save(params,
+                                                   os.path.join(args.model_dir,
+                                                                'logging',
+                                                                params_filename))
+                        else:
+                            optimizer.step()
                     lr_scheduler.step()
-                    if args.use_ema and ema_model is not None:
-                        ema_model.step(unet)
+                    if accelerator.sync_gradients:
+                        if args.use_ema and ema_model is not None:
+                            ema_model.step(unet)
                     if profiler is not None:
                         profiler.step()
 
+                    # wrapped .zero_grad() is called if sync_gradients
                     optimizer.zero_grad(set_to_none=args.gradient_set_to_none)
 
                 allocated = round(torch.cuda.memory_allocated(0) / 1024 ** 3, 1)
@@ -1650,8 +1748,6 @@ def main(null_guidance_scale=0.0,
                     'target': target.detach().cpu(),
                     'target_pred_dif': (target.detach().cpu()
                                         - pred.detach().cpu())}
-                gc.collect()
-
                 del pred
                 del noise_pred
                 del noise_pred_output
@@ -1683,21 +1779,33 @@ def main(null_guidance_scale=0.0,
                         "epoch": epoch, 
                         "lr": float(last_lr),
                         "loss": float(loss_step),
-                        "inst_loss": float(instance_loss.detach().item()),
-                        "prior_loss": float(prior_loss.detach().item()),
                         "vram": float(cached),
-                        "inst_loss_mean": float(instance_loss_mean.item()),
-                        "prior_loss_mean": float(prior_loss_mean.item()),
                         "inst_loss_weight": instance_loss_weight,
-                        "param_l2_norm": float(param_l2_norm.detach().item()),
                     }
-                    if param_to_optimize_datas is not None:
+                    if len(instance_chunks):
                         logs.update(
                             {
-                                "params_datas_norm": float(torch.linalg.norm(param_to_optimize_datas).item()),
-                                "params_datas_maximum": float(torch.max(torch.abs(param_to_optimize_datas)).item()),
-                                "params_grads_norm": float(torch.linalg.norm(param_to_optimize_grads).item()),
-                                "params_grads_maximum": float(torch.max(torch.abs(param_to_optimize_grads)).item()),
+                                "inst_loss": float(instance_loss.detach().item()),
+                            })
+                    if len(prior_chunks):
+                        logs.update(
+                            {
+                                "prior_loss": float(prior_loss.detach().item()),
+                            })
+                    if args.l2_regularization:
+                        logs.update(
+                            {
+                                "param_l2_norm2": float(param_l2_norm2.detach().item()),
+                            })
+                    if grads_dot is not None:
+                        logs.update(
+                            {
+                                "grads_dot": float(grads_dot.item()),
+                                "offseted_grads_dot": float(offseted_grads_dot.item()),
+                                "grads_cos": float(grads_cos.item()),
+                                "param_grads_norm": float(param_grads_norm.item()),
+                                "prior_grads_norm": float(prior_grads_norm.item()),
+                                "offseted_param_grads_norm": float(offseted_param_grads_norm.item()),
                             })
                     if cliped_grad_norm is not None:
                         logs.update(

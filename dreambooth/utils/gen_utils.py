@@ -15,7 +15,7 @@ def build_resolution_dataset_and_sampler(
         class_prompts: List[PromptData],
         batch_size: int = None,
         vae=None,
-        split_size: int = 1):
+        interleave_size: int = 1):
     print(f"Found {len(class_prompts)} reg images.")
     res_instance_datasets = build_resolution_datasets(
         instance_prompts,
@@ -30,7 +30,7 @@ def build_resolution_dataset_and_sampler(
             batch_size,
             res_instance_datasets,
             res_class_datasets,
-            split_size)
+            interleave_size)
     print(f"Total dataset length: {len(res_dataset)}")
     print(f"Total sampler length: {len(res_sampler)}")
     return (res_dataset, res_sampler)

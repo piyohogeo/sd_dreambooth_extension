@@ -30,7 +30,7 @@ class InstanceBalancedBatchSampler:
                  batch_size: int,
                  instance_dataset: DbDatasetForResolution,
                  class_dataset: DbDatasetForResolution,
-                 split_size: int = 1):
+                 interleave_size: int = 1):
         # half of batch are instance and rests are class
         # instance are oversampled
         assert batch_size % 2 == 0
@@ -38,7 +38,7 @@ class InstanceBalancedBatchSampler:
         self.batch_size = batch_size
         self._shorter_dataset = instance_dataset
         self._longer_dataset = class_dataset
-        self._split_size = split_size
+        self._interleave_size = interleave_size
 
         self.concated_dataset = ConcatDataset(
             [self._longer_dataset, self._shorter_dataset])
@@ -61,8 +61,9 @@ class InstanceBalancedBatchSampler:
             return [xs[i:i + n] for i in range(0, len(xs), n)
                     if i + n < len(xs)]
         return list(sum(map(lambda xy: sum(xy, []),
-                    zip(split_list(longer_indexes, self._split_size),
-                        split_list(shorter_indexes, self._split_size)))), [])
+                    zip(split_list(longer_indexes, self._interleave_size),
+                        split_list(shorter_indexes, self._interleave_size))),
+                        []))
 
     def __iter__(self):
         indexes = self._build_indexes()
@@ -122,7 +123,7 @@ class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
                                         DbDatasetForResolution],
             res_class_datasets: Dict[Tuple[int, int],
                                      DbDatasetForResolution],
-            split_size: int = 1
+            interleave_size: int = 1
             ) -> Tuple[BatchSampler, Dataset]:
         assert set(res_instance_datasets.keys())\
             == set(res_class_datasets.keys())
@@ -130,7 +131,7 @@ class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
                 batch_size,
                 res_instance_datasets[res],
                 res_class_datasets[res],
-                split_size=split_size)
+                interleave_size=interleave_size)
                 for res in res_instance_datasets.keys()]
         res_sampler = ResolutionedInstanceBalancedBatchSampler(
             batch_size, samplers)

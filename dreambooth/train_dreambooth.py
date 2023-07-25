@@ -1140,10 +1140,12 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                         device=latents.device,
                     )
                     timesteps = timesteps.long()
+                    timesteps_input = torch.concat([timesteps] * 2)
 
                     # Add noise to the latents according to the noise magnitude at each timestep
                     # (this is the forward diffusion process)
                     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    noisy_latents_input = torch.cat([noisy_latents] * 2)
                     pad_tokens = args.pad_tokens if train_tenc else False
                     encoder_hidden_states = encode_hidden_state(
                         text_encoder,
@@ -1163,25 +1165,24 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                         tokenizer.model_max_length,
                         args.clip_skip,
                     )
+                    encoder_hidden_states_input = torch.cat(
+                        [uncond_encoder_hidden_states, encoder_hidden_states])
+
 
                     # Predict the noise residual
                     if args.use_ema and args.ema_predict:
-                        noise_pred_text = ema_model(
-                            noisy_latents, timesteps, encoder_hidden_states
-                        ).sample
-                        noise_pred_uncond = ema_model(
-                            noisy_latents, timesteps, uncond_encoder_hidden_states
+                        noise_pred_output = ema_model(
+                            noisy_latents_input, timesteps_input, 
+                            encoder_hidden_states_input
                         ).sample
                     else:
-                        noise_pred_text = unet(
-                            noisy_latents, timesteps, encoder_hidden_states
+                        noise_pred_output = unet(
+                            noisy_latents_input, timesteps_input, 
+                            encoder_hidden_states_input
                         ).sample
-                        noise_pred_uncond = unet(
-                            noisy_latents, timesteps, uncond_encoder_hidden_states
-                        ).sample
-
 
                     guidance_scale = 7.0
+                    noise_pred_uncond, noise_pred_text = noise_pred_output.chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # Get the target for loss depending on the prediction type
@@ -1271,12 +1272,17 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                 status.job_no += train_batch_size
 
                 del noise_pred
+                del noise_pred_output
+                del noise_pred_text
+                del noise_pred_uncond
                 del latents
                 del encoder_hidden_states
                 del uncond_encoder_hidden_states
                 del noise
                 del timesteps
+                del timesteps_input
                 del noisy_latents
+                del noisy_latents_input
                 del target
 
                 loss_step = loss.detach().item()

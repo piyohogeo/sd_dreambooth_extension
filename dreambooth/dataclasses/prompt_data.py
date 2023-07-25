@@ -17,6 +17,8 @@ class PromptData:
     seed: int = -1
     resolution: Tuple[int, int] = (512, 512)
     concept_index: int = 0
+    is_class_image: bool = False
+    weight: float = 1.0
 
     def __post_init__(self):
         if self.seed == -1:

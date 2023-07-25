@@ -1,138 +1,138 @@
 import random
-from typing import Tuple
+from typing import Tuple, Dict, List
 
-from dreambooth.dataset.db_dataset import DbDataset
+import numpy as np
+from torch.utils.data import ConcatDataset, Dataset
+from torch.utils.data.sampler import BatchSampler
+
+from dreambooth.dataset.db_dataset import DbDatasetForResolution
 
 
-class BucketSampler:
-    def __init__(self, dataset: DbDataset, batch_size, debug=False):
-        self.dataset = dataset
+def build_weighted_sample_indexes(weights, output_length: int):
+    shuffeled_index_weights = list(enumerate(weights))
+    # shuffle cumsum order
+    random.shuffle(shuffeled_index_weights)
+    shuffled_indexes, shuffeled_weights = zip(*shuffeled_index_weights)
+
+    cumsum_weights = np.cumsum(np.insert(shuffeled_weights, 0, 0.0))
+    scale = output_length / cumsum_weights[-1]
+    cumsum_weights = cumsum_weights * scale
+    indexes = np.array(range(len(cumsum_weights)))
+    weighted_indexes = np.interp(np.array(range(output_length)),
+                                 cumsum_weights, indexes).astype(np.int64)
+    unshuffeled_weighted_indexes = [shuffled_indexes[i]
+                                    for i in weighted_indexes]
+    return unshuffeled_weighted_indexes
+
+
+class InstanceBalancedBatchSampler:
+    def __init__(self,
+                 batch_size: int,
+                 instance_dataset: DbDatasetForResolution,
+                 class_dataset: DbDatasetForResolution,
+                 split_size: int = 1):
+        # half of batch are instance and rests are class
+        # instance are oversampled
+        assert batch_size % 2 == 0
+        assert len(class_dataset) >= len(instance_dataset)
         self.batch_size = batch_size
-        self.resolutions = dataset.resolutions
-        self.active_resos = []
-        self.bucket_counter = BucketCounter(starting_keys=self.resolutions)
-        self.batch = []
-        self.current_bucket = 0
-        self.current_index = 0
-        self.total_samples = 0
-        self.debug = debug
-        self.set_buckets()
+        self._shorter_dataset = instance_dataset
+        self._longer_dataset = class_dataset
+        self._split_size = split_size
+
+        self.concated_dataset = ConcatDataset(
+            [self._longer_dataset, self._shorter_dataset])
+
+    def _build_indexes(self):
+        longer_indexes = list(range(len(self._longer_dataset)))
+        random.shuffle(longer_indexes)
+
+        shorter_weights = self._shorter_dataset.get_weights()
+        shorter_indexes = build_weighted_sample_indexes(
+            shorter_weights, len(longer_indexes))
+        random.shuffle(shorter_indexes)
+
+        assert len(longer_indexes) == len(shorter_indexes)
+        # add offset for concated dataset
+        shorter_indexes = [len(self._longer_dataset) + index
+                           for index in shorter_indexes]
+
+        def split_list(xs, n):
+            return [xs[i:i + n] for i in range(0, len(xs), n)
+                    if i + n < len(xs)]
+        return list(sum(map(lambda xy: sum(xy, []),
+                    zip(split_list(longer_indexes, self._split_size),
+                        split_list(shorter_indexes, self._split_size)))), [])
 
     def __iter__(self):
-        while self.total_samples < len(self.dataset):
-            batch = self.fill_batch()
-            if len(batch) == 0:
-                raise StopIteration
-            yield batch
-        self.total_samples = 0
-
-    def __next__(self):
-        if len(self.batch) == 0:
-            self.batch = self.fill_batch()
-        if len(self.batch) == 0:
-            print("Well, this is bad. We have no batch data.")
-            raise StopIteration
-        return self.batch.pop()
+        indexes = self._build_indexes()
+        for i in range(len(indexes) // self.batch_size):
+            start_index = i * self.batch_size
+            batched_indexes = indexes[start_index:start_index
+                                      + self.batch_size]
+            yield batched_indexes
 
     def __len__(self):
-        return len(self.dataset.active_resolution) * self.batch_size
-
-    def set_buckets(self):
-        # Initialize list of bucket counts if not set
-        all_resos = self.resolutions
-        resos_to_use = []
-        am = self.bucket_counter.missing()
-        missing = am.copy()
-        pop_index = 0
-        # Tell the counter to check if all values are equal. If so, reset the counts to 0
-        self.bucket_counter.check_reset()
-        if len(missing):
-            while len(resos_to_use) < len(all_resos):
-                if len(missing):
-                    for res, count in am.items():
-                        resos_to_use.append(res)
-                        missing[res] -= 1
-                        if missing[res] == 0:
-                            del missing[res]
-                        am = missing.copy()
-                else:
-                    resos_to_use.append(all_resos[pop_index])
-                    pop_index += 1
-                    if pop_index >= len(all_resos):
-                        pop_index = 0
-        else:
-            resos_to_use = all_resos.copy()
-        if not self.debug:
-            random.shuffle(resos_to_use)
-        self.active_resos = resos_to_use
-        self.current_bucket = 0
-
-    def fill_batch(self):
-        current_res = self.active_resos[self.current_bucket]
-        self.dataset.shuffle_buckets()
-        batch = []
-        repeats = 0
-        while len(batch) < self.batch_size:
-            self.dataset.active_resolution = current_res
-            img_index, img_repeats = self.dataset.get_example(current_res)
-            # next_item = torch.as_tensor(next_item, device='cpu', dtype=torch.float)
-            if img_repeats != 0:
-                self.bucket_counter.count(current_res)
-                repeats += 1
-            batch.append(img_index)
-            self.total_samples += 1
-        if repeats != 0:
-            # Increment bucket if we've 'emptied' the current one
-            self.current_bucket += 1
-            # If we've run through our list of resolutions, re-create it
-            if self.current_bucket >= len(self.active_resos):
-                self.set_buckets()
-        return batch
-
-    def __getitem__(self, index):
-        if len(self.batch) == 0:
-            self.batch = self.fill_batch()
-        if len(self.batch) == 0:
-            print("Well, this is bad. We have no batch data.")
-            raise StopIteration
-        return self.batch.pop()
+        return 2 * len(self._longer_dataset) // self.batch_size
 
 
-class BucketCounter:
-    def __init__(self, starting_keys=None):
-        self.counts = {}
-        print("Initializing bucket counter!")
-        if starting_keys is not None:
-            for key in starting_keys:
-                self.counts[key] = 0
+class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
+    def __init__(self,
+                 batch_size: int,
+                 samplers: List[InstanceBalancedBatchSampler]):
+        self.sampler = None
+        self._samplers = samplers
+        self.batch_size = batch_size
+        self._concated_dataset = ConcatDataset(
+            [sampler.concated_dataset for sampler in self._samplers])
 
-    def count(self, key: Tuple[int, int]):
-        if key in self.counts:
-            self.counts[key] += 1
-        else:
-            self.counts[key] = 1
+        self._length = len(self._build_sampler_indexes())
 
-    def min(self):
-        return min(self.counts.values()) if len(self.counts) else 0
+    def _build_sampler_indexes(self):
+        sampler_indexes = sum([[sampler_index] * len(sampler)
+                               for sampler_index, sampler
+                               in enumerate(self._samplers)], [])
+        random.shuffle(sampler_indexes)
+        return sampler_indexes
 
-    def max(self):
-        return max(self.counts.values()) if len(self.counts) else 0
+    def __iter__(self):
+        sampler_indexes = self._build_sampler_indexes()
+        offset_indexes = np.cumsum([0] + list(map(len, self._samplers)))
+        sampler_iterators = [(start_index, iter(sampler))
+                             for start_index, sampler
+                             in zip(offset_indexes, self._samplers)]
+        for sampler_index in sampler_indexes:
+            try:
+                offset_index, sampler =\
+                    sampler_iterators[sampler_index]
+                local_indexes = next(sampler)
+                global_indexes = [offset_index + local_index
+                                  for local_index in local_indexes]
+                yield global_indexes
+            except StopIteration:
+                continue
 
-    def get(self, key: Tuple[int, int]):
-        return self.counts[key] if key in self.counts else 0
+    def __len__(self):
+        return self._length
 
-    def check_reset(self):
-        if self.max() == self.min():
-            for key in list(self.counts.keys()):
-                self.counts[key] = 0
+    @staticmethod
+    def build_dataset_and_sampler(
+            batch_size: int,
+            res_instance_datasets: Dict[Tuple[int, int],
+                                        DbDatasetForResolution],
+            res_class_datasets: Dict[Tuple[int, int],
+                                     DbDatasetForResolution],
+            split_size: int = 1
+            ) -> Tuple[BatchSampler, Dataset]:
+        assert set(res_instance_datasets.keys())\
+            == set(res_class_datasets.keys())
+        samplers = [InstanceBalancedBatchSampler(
+                batch_size,
+                res_instance_datasets[res],
+                res_class_datasets[res],
+                split_size=split_size)
+                for res in res_instance_datasets.keys()]
+        res_sampler = ResolutionedInstanceBalancedBatchSampler(
+            batch_size, samplers)
+        return (res_sampler, res_sampler._concated_dataset)
 
-    def missing(self):
-        out = {}
-        max = self.max()
-        for key in list(self.counts.keys()):
-            if self.counts[key] < max:
-                out[key] = max - self.counts[key]
-        return out
-
-    def print(self):
-        print(f"Bucket counts: {self.counts}")

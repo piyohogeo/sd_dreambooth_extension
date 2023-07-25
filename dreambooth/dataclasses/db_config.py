@@ -30,11 +30,16 @@ class DreamboothConfig(BaseModel):
     adaptation_eps: float = 1e-8
     attention: str = "xformers"
     cache_latents: bool = True
+    clip_grad_norm_global: float = 1.0
+    clip_grad_norm: float = 1.0
+    clip_grad_value: float = 1.0
+    clip_loss: float = 0.0
     clip_skip: int = 1
     concepts_list: List[Dict] = []
     concepts_path: str = ""
     custom_model_name: str = ""
     noise_scheduler: str = "DDPM"
+    dataset_mix_split_size: int = 1
     deterministic: bool = False
     ema_predict: bool = False
     epoch: int = 0
@@ -57,6 +62,8 @@ class DreamboothConfig(BaseModel):
     hflip: bool = False
     infer_ema: bool = False
     initial_revision: int = 0
+    l2_regularization: bool = False
+    l2_regularization_lambda: float = 1e-5
     learning_rate: float = 5e-6
     learning_rate_min: float = 1e-6
     lifetime_revision: int = 0
@@ -74,6 +81,7 @@ class DreamboothConfig(BaseModel):
     lr_scheduler: str = "constant_with_warmup"
     lr_warmup_steps: int = 0
     max_token_length: int = 75
+    mean_batch_count: int = 100
     mixed_precision: str = "fp16"
     model_name: str = ""
     model_dir: str = ""

@@ -110,7 +110,7 @@ class EMAModel(object):
                 ema_param.copy_(param)
             else:
                 ema_param.mul_(decay)
-                ema_param.add_(param.to(dtype=ema_param.dtype), alpha=1 - decay)
+                ema_param.add_(param.to(dtype=ema_param.dtype).to(ema_param.device), alpha=1 - decay)
             ema_state_dict[key] = ema_param
         self.load(ema_state_dict, build_params=False)
 

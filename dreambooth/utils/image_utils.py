@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import math
@@ -61,21 +62,7 @@ def rotate_image_straight(image: Image) -> Image:
 
 
 def get_images(image_path: str):
-    pil_features = list_features()
-    output = []
-    if os.path.exists(image_path):
-        for file in os.listdir(image_path):
-            # Mac creates metadata files for every image with name `._{filename}`, so we skip it
-            if sys.platform == 'darwin' and file.startswith('._'):
-                continue
-            file_path = os.path.join(image_path, file)
-            if is_image(file_path, pil_features):
-                output.append(file_path)
-            if os.path.isdir(file_path):
-                sub_images = get_images(file_path)
-                for image in sub_images:
-                    output.append(image)
-    return output
+    return glob.glob(os.path.join(image_path, '**', '*.png'), recursive=True)
 
 
 def list_features():
@@ -106,13 +93,11 @@ def is_image(path: str, feats=None):
 def sort_prompts(
         concept: Concept,
         json_getter: FilenameJsonGetter,
-        img_dir: str,
         images: List[str],
         bucket_resos: List[Tuple[int, int]],
         concept_index: int,
-        is_class: bool,
+        is_class_image: bool,
         pbar: mytqdm,
-        verbatim=False
 ) -> Dict[Tuple[int, int], PromptData]:
     prompts = {}
     max_dim = 0
@@ -121,25 +106,19 @@ def sort_prompts(
             max_dim = w
         if h > max_dim:
             max_dim = h
-    _, dirr = os.path.split(img_dir)
     for img in images:
         # Get prompt
-        pbar.set_description(f"Pre-processing images: {dirr}")
+        parameters = json_getter.read_text(img)
 
-        file_parameters = json_getter.read_text(img)
-        if verbatim:
-            parameters = file_parameters
+        if type(parameters['Size']) is str:
+            w, h = map(int, re.match('([0-9]+)x([0-9]+)',
+                                     parameters['Size']).groups())
         else:
-            parameters = json_getter.create_text(
-                concept.class_prompt if is_class else concept.instance_prompt,
-                file_parameters,
-                concept,
-                is_class
-            )
-
-        w, h = get_dim(img, max_dim)
+            w, h = parameters['Size']
         reso = closest_resolution(w, h, bucket_resos)
         prompt_list = prompts[reso] if reso in prompts else []
+        weight = (parameters['TrainingWeight']
+                  if 'TrainingWeight' in parameters else 1.0)
         pd = PromptData(
             prompt=parameters[FilenameJsonGetter.CAPTION_KEY],
             negative_prompt=parameters['Negative prompt'],
@@ -149,7 +128,9 @@ def sort_prompts(
             steps=int(parameters['Steps']),
             scale=float(parameters['CFG scale']),
             resolution=reso,
-            concept_index=concept_index
+            concept_index=concept_index,
+            is_class_image=is_class_image,
+            weight=weight,
         )
         prompt_list.append(pd)
         pbar.update()
@@ -160,11 +141,8 @@ def sort_prompts(
 class FilenameJsonGetter:
     CAPTION_KEY = 'TrainingTags'
 
-    re_numbers_at_start = re.compile(r"^[-\d]+\s*")
-
-    def __init__(self, shuffle_tags=False):
-        # ignore
-        _ = shuffle_tags
+    def __init__(self):
+        pass
 
     def read_text(self, img_path):
         img_dir, img_filename = os.path.split(img_path)
@@ -176,69 +154,6 @@ class FilenameJsonGetter:
         with open(json_filepath, "r", encoding="utf-8") as file:
             parameters = json.load(file)
         return parameters
-
-    def create_text(self, prompt, parameters, concept, is_class=True):
-        instance_token = concept.instance_token
-        class_token = concept.class_token
-        output = prompt.replace("[filewords]", parameters[self.CAPTION_KEY])
-
-        if instance_token and class_token:
-            instance_regex = re.compile(f"\\b{instance_token}\\b", flags=re.IGNORECASE)
-            class_regex = re.compile(f"\\b{class_token}\\b", flags=re.IGNORECASE)
-            extended_class_regexes = list(
-                re.compile(r) for r in [f"a {class_token}", f"the {class_token}", f"an {class_token}", class_token])
-
-            if is_class:
-                if instance_regex.search(output):
-                    if class_regex.search(output):
-                        output = instance_regex.sub("", output)
-                    else:
-                        output = instance_regex.sub(class_token, output)
-                if not class_regex.search(output):
-                    output = f"{class_token}, {output}"
-
-            else:
-                if class_regex.search(output):
-                    # Do nothing if we already have class and instance in string
-                    if instance_regex.search(output):
-                        pass
-                    # Otherwise, substitute class tokens for the base token
-                    else:
-                        for extended_class_regex in extended_class_regexes:
-                            output = extended_class_regex.sub(class_token, output)
-
-                        # Now, replace class with instance + class tokens
-                        output = class_regex.sub(f"{instance_token}", output)
-                else:
-                    # If class is not in the string, check if instance is
-                    if instance_regex.search(output):
-                        output = instance_regex.sub(f"{instance_token}", output)
-                    else:
-                        # Description only, insert both at the front?
-                        output = f"{instance_token}, {output}"
-
-        elif instance_token and not is_class:
-            output = f"{instance_token}, {output}"
-
-        elif class_token and is_class:
-            output = f"{class_token}, {output}"
-
-        output = re.sub(r"\s+", " ", output)
-        output = re.sub(r"\\", "", output)
-
-        output = output.strip()
-
-        parameters[self.CAPTION_KEY] = output
-        return parameters
-
-
-def shuffle_tags(caption: str):
-    tags = caption.split(',')
-    first_tag = tags.pop(0)
-    random.shuffle(tags)
-    tags.insert(0, first_tag)
-    output = ','.join(tags).strip()
-    return output
 
 
 def get_scheduler_names():

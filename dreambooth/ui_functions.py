@@ -1020,7 +1020,7 @@ def debug_buckets(model_name, num_epochs, batch_size):
     print("Preparing prompt dataset...")
 
     prompt_dataset = ClassDataset(
-        args.concepts(), args.model_dir, args.resolution, False
+        args.concepts(), args.resolution
     )
     inst_paths = prompt_dataset.instance_prompts
     class_paths = prompt_dataset.class_prompts
@@ -1031,7 +1031,6 @@ def debug_buckets(model_name, num_epochs, batch_size):
         class_paths,
         batch_size,
         debug=True,
-        model_dir=args.model_dir,
     )
 
     placeholder = [torch.Tensor(10, 20)]

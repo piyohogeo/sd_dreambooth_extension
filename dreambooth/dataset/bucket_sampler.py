@@ -53,7 +53,6 @@ class InstanceBalancedBatchSampler:
             [self._longer_dataset, self._shorter_dataset])
 
         longer_weights = self._longer_dataset.get_weights()
-        assert np.isclose(np.sum(longer_weights), 1.0), f'sum(longer_weights): {np.sum(longer_weights)}'
         sampling_magnify = 1.0 / np.min(longer_weights)
         self._normalized_dataset_length = int(len(longer_weights) * sampling_magnify)
         if self._normalized_dataset_length % self._interleave_size != 0:

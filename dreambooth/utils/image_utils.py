@@ -16,7 +16,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 from PIL import features, PngImagePlugin, Image, ExifTags
 
 import os
-from typing import List, Tuple, Dict, Union
+from typing import List, Tuple, Dict, Union, Optional
 
 import numpy as np
 import torch
@@ -62,7 +62,7 @@ def rotate_image_straight(image: Image) -> Image:
 
 
 def get_images(image_path: str):
-    return glob.glob(os.path.join(image_path, '**', '*.png'), recursive=True)
+    return glob.glob(os.path.join(image_path, '*.png'), recursive=True)
 
 
 def list_features():
@@ -98,7 +98,11 @@ def sort_prompts(
         concept_index: int,
         is_class_image: bool,
         pbar: mytqdm,
+        parameter_weight_tag: str = 'TrainingWeight',
+        prompt_tag: Optional[str] = None,
 ) -> Dict[Tuple[int, int], PromptData]:
+    if prompt_tag is None:
+        prompt_tag = FilenameJsonGetter.CAPTION_KEY
     prompts = {}
     max_dim = 0
     for (w, h) in bucket_resos:
@@ -117,10 +121,12 @@ def sort_prompts(
             w, h = parameters['Size']
         reso = closest_resolution(w, h, bucket_resos)
         prompt_list = prompts[reso] if reso in prompts else []
-        weight = (parameters['TrainingWeight']
-                  if 'TrainingWeight' in parameters else 1.0)
+        weight = (parameters[parameter_weight_tag]
+                  if parameter_weight_tag in parameters else (
+                    parameters['TrainingWeight']
+                    if 'TrainingWeight' in parameters else 1.0))
         pd = PromptData(
-            prompt=parameters[FilenameJsonGetter.CAPTION_KEY],
+            prompt=parameters[prompt_tag],
             negative_prompt=parameters['Negative prompt'],
             instance_token=concept.instance_token,
             class_token=concept.class_token,
@@ -145,13 +151,17 @@ class FilenameJsonGetter:
     def __init__(self):
         pass
 
-    def read_text(self, img_path):
+    def build_parameter_path(self, img_path):
         img_dir, img_filename = os.path.split(img_path)
         json_filepath = os.path.join(
             img_dir, 'parameters',
             os.path.splitext(img_filename)[0] + '.json')
+        return json_filepath
 
-        assert os.path.exists(json_filepath)
+    def read_text(self, img_path):
+        json_filepath = self.build_parameter_path(img_path)
+
+        assert os.path.exists(json_filepath), img_path
         with open(json_filepath, "r", encoding="utf-8") as file:
             parameters = json.load(file)
         return parameters

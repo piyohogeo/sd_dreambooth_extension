@@ -1,4 +1,6 @@
+import json
 import random
+import threading
 from typing import Tuple, Dict, List
 
 import numpy as np
@@ -28,6 +30,7 @@ def build_weighted_sample_indexes(weights, output_length: int):
                                  cumsum_weights, indexes).astype(np.int64)
     unshuffeled_weighted_indexes = [shuffled_indexes[i]
                                     for i in weighted_indexes]
+    assert len(unshuffeled_weighted_indexes) == output_length
     return unshuffeled_weighted_indexes
 
 
@@ -49,14 +52,24 @@ class InstanceBalancedBatchSampler:
         self.concated_dataset = ConcatDataset(
             [self._longer_dataset, self._shorter_dataset])
 
-    def _build_indexes(self):
-        longer_indexes = list(range(len(self._longer_dataset)))
-        random.shuffle(longer_indexes)
+        longer_weights = self._longer_dataset.get_weights()
+        assert np.isclose(np.sum(longer_weights), 1.0), f'sum(longer_weights): {np.sum(longer_weights)}'
+        sampling_magnify = 1.0 / np.min(longer_weights)
+        self._normalized_dataset_length = int(len(longer_weights) * sampling_magnify)
+        if self._normalized_dataset_length % self._interleave_size != 0:
+            self._normalized_dataset_length = ((self._normalized_dataset_length
+                                                // self._interleave_size + 1)
+                                               * self._interleave_size)
 
+    def _build_indexes(self):
         shorter_weights = self._shorter_dataset.get_weights()
+        longer_weights = self._longer_dataset.get_weights()
         shorter_indexes = build_weighted_sample_indexes(
-            shorter_weights, len(longer_indexes))
+            shorter_weights, self._normalized_dataset_length)
+        longer_indexes = build_weighted_sample_indexes(
+            longer_weights, self._normalized_dataset_length)
         random.shuffle(shorter_indexes)
+        random.shuffle(longer_indexes)
 
         assert len(longer_indexes) == len(shorter_indexes)
         # add offset for concated dataset
@@ -65,14 +78,18 @@ class InstanceBalancedBatchSampler:
 
         def split_list(xs, n):
             return [xs[i:i + n] for i in range(0, len(xs), n)
-                    if i + n < len(xs)]
-        return list(sum(map(lambda xy: sum(xy, []),
+                    if i + n <= len(xs)]
+        return list(sum(map(lambda xy: xy[0] + xy[1],
                     zip(split_list(longer_indexes, self._interleave_size),
                         split_list(shorter_indexes, self._interleave_size))),
                         []))
 
     def __iter__(self):
         indexes = self._build_indexes()
+        assert len(indexes) // self.batch_size == self.__len__()
+        with open('/mnt/d/log/tmp/indexes%08x.json' % threading.get_ident(),
+                  'w', encoding='utf-8') as f:
+            json.dump(indexes, f)
         for i in range(len(indexes) // self.batch_size):
             start_index = i * self.batch_size
             batched_indexes = indexes[start_index:start_index
@@ -80,7 +97,7 @@ class InstanceBalancedBatchSampler:
             yield batched_indexes
 
     def __len__(self):
-        return 2 * len(self._longer_dataset) // self.batch_size
+        return 2 * self._normalized_dataset_length // self.batch_size
 
 
 class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
@@ -100,6 +117,9 @@ class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
                                for sampler_index, sampler
                                in enumerate(self._samplers)], [])
         random.shuffle(sampler_indexes)
+        with open('/mnt/d/log/tmp/sampler_indexes%08x.json' % threading.get_ident(),
+                  'w', encoding='utf-8') as f:
+            json.dump(sampler_indexes, f)
         return sampler_indexes
 
     def __iter__(self):

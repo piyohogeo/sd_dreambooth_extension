@@ -1,18 +1,18 @@
 import json
 import os
-from typing import Dict, Union
+from typing import List, Dict, Union
 
 from pydantic import BaseModel
 
 
 class Concept(BaseModel):
-    class_data_dir: str = ""
+    class_data_dir: Union[str, List[str]] = ""
     class_guidance_scale: float = 7.5
     class_infer_steps: int = 60
     class_negative_prompt: str = ""
     class_prompt: str = ""
     class_token: str = ""
-    instance_data_dir: str = ""
+    instance_data_dir: Union[str, List[str]] = ""
     instance_prompt: str = ""
     instance_token: str = ""
     is_valid: bool = False

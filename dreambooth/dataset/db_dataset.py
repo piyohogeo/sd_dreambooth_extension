@@ -122,8 +122,8 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
         os.makedirs(os.path.split(latent_path)[0], exist_ok=True)
 
         image = Image.open(image_path)
-        if image.size != self._resolution:
-            return False
+        #if image.size != self._resolution:
+        #    return False
         assert image.size == self._resolution, (
                 f'{image_path}: {image.size}, {self._resolution}')
 

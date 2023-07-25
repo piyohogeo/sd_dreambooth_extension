@@ -3,7 +3,7 @@ import os
 import pickle
 import threading
 
-from typing import Callable
+from typing import Callable, Optional
 
 from dreambooth import shared
 from dreambooth.dataclasses.db_concept import Concept
@@ -17,7 +17,10 @@ from helpers.mytqdm import mytqdm
 class ClassDataset:
     """A simple dataset to prepare the prompts to generate class images on multiple GPUs."""
 
-    def __init__(self, concepts: [Concept], max_width: int):
+    def __init__(self, concepts: [Concept],
+                 max_width: int,
+                 parameter_weight_tag: str = 'TrainingWeight',
+                 prompt_tag: Optional[str] = None):
         # Existing training image data
         self.instance_prompts = []
         # Existing class image data
@@ -50,9 +53,16 @@ class ClassDataset:
                 continue
             tmp_file_postfix = '.%08x.tmp' % threading.get_ident()
 
-            def build_cache_path(image_paths):
+            def build_cache_path(is_instance, image_paths):
+                image_path_mtimes = [(
+                    image_paths,
+                    os.stat(json_getter.build_parameter_path(image_path)).st_mtime)
+                    for image_path in sorted(image_paths)]
                 filename = hashlib.sha256(pickle.dumps(
-                    list(sorted(image_paths)))).hexdigest() + '.pickle'
+                    (is_instance,
+                     parameter_weight_tag,
+                     prompt_tag,
+                     image_path_mtimes))).hexdigest() + '.pickle'
                 image_dir, _ = os.path.split(image_paths[0])
                 cache_dir = os.path.join(image_dir, 'parameters_cache')
                 os.makedirs(cache_dir, exist_ok=True)
@@ -61,7 +71,7 @@ class ClassDataset:
 
             if len(instance_images[concept_idx]):
                 pbar.set_description(f"Pre-processing images: {os.path.split(instance_dir)[1]}")
-                instance_cache_path = build_cache_path(instance_images[concept_idx])
+                instance_cache_path = build_cache_path(True, instance_images[concept_idx])
                 if os.path.exists(instance_cache_path):
                     with open(instance_cache_path, 'rb') as f:
                         instance_prompt_datass = pickle.load(f)
@@ -75,7 +85,9 @@ class ClassDataset:
                         bucket_resos,
                         concept_idx,
                         is_class_image=False,
-                        pbar=pbar)
+                        pbar=pbar,
+                        parameter_weight_tag=parameter_weight_tag,
+                        prompt_tag=prompt_tag)
                     instance_prompt_datass =\
                         sum([instance_prompt_datas
                              for _, instance_prompt_datas
@@ -96,7 +108,7 @@ class ClassDataset:
                 continue
 
             pbar.set_description(f"Pre-processing images: {os.path.split(class_dir)[1]}")
-            class_cache_path = build_cache_path(class_images[concept_idx])
+            class_cache_path = build_cache_path(False, class_images[concept_idx])
             if os.path.exists(class_cache_path):
                 with open(class_cache_path, 'rb') as f:
                     class_prompt_datass = pickle.load(f)
@@ -109,7 +121,9 @@ class ClassDataset:
                     bucket_resos,
                     concept_idx, 
                     is_class_image=True,
-                    pbar=pbar)
+                    pbar=pbar,
+                    parameter_weight_tag=parameter_weight_tag,
+                    prompt_tag=prompt_tag)
 
                 class_prompt_datass =\
                     sum([class_prompt_datas

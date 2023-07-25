@@ -156,16 +156,16 @@ def _find_modules_v2(
         search_class = [nn.Linear]
     if ancestor_class is not None:
         ancestors = (
-            module
-            for module in model.modules()
+            (name, module)
+            for name, module in model.named_modules()
             if module.__class__.__name__ in ancestor_class
         )
     else:
         # this, incase you want to naively iterate over all modules.
-        ancestors = [module for module in model.modules()]
+        ancestors = [(name, module) for name, module in model.named_modules()]
 
     # For each target find every linear_class module that isn't a child of a LoraInjectedLinear
-    for ancestor in ancestors:
+    for ancestor_name, ancestor in ancestors:
         for fullname, module in ancestor.named_modules():
             if any([isinstance(module, _class) for _class in search_class]):
                 # Find the direct parent if this is a descendant, not a child, of target
@@ -179,7 +179,7 @@ def _find_modules_v2(
                 ):
                     continue
                 # Otherwise, yield it
-                yield parent, name, module
+                yield parent, name, module, ancestor_name + fullname
 
 
 def _find_modules_old(
@@ -210,6 +210,7 @@ def inject_trainable_lora(
         target_replace_module=None,
         r: int = 4,
         loras=None,  # path to lora .pt
+        no_train_keywords=None,
 ):
     """
     inject lora into model, and returns lora parameter groups.
@@ -224,7 +225,7 @@ def inject_trainable_lora(
     if loras is not None:
         loras = torch.load(loras)
 
-    for _module, name, _child_module in _find_modules(
+    for _module, name, _child_module, _fullname in _find_modules(
             model, target_replace_module, search_class=[nn.Linear]
     ):
         weight = _child_module.weight
@@ -243,16 +244,22 @@ def inject_trainable_lora(
         _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
         _module._modules[name] = _tmp
 
-        require_grad_params.append(_module._modules[name].lora_up.parameters())
-        require_grad_params.append(_module._modules[name].lora_down.parameters())
-
         if loras is not None:
             _module._modules[name].lora_up.weight = nn.Parameter(loras.pop(0))
             _module._modules[name].lora_down.weight = nn.Parameter(loras.pop(0))
 
-        _module._modules[name].lora_up.weight.requires_grad = True
-        _module._modules[name].lora_down.weight.requires_grad = True
-        names.append(name)
+        if any([k in _fullname for k in no_train_keywords]):
+            nn.init.zeros_(_module._modules[name].lora_down.weight)
+            nn.init.zeros_(_module._modules[name].lora_up.weight)
+            _module._modules[name].scale = 0.0
+            print('Skip no_train:', _fullname)
+        else:
+            require_grad_params.append(_module._modules[name].lora_up.parameters())
+            require_grad_params.append(_module._modules[name].lora_down.parameters())
+
+            _module._modules[name].lora_up.weight.requires_grad = True
+            _module._modules[name].lora_down.weight.requires_grad = True
+            names.append(_fullname)
 
     enable_safe_unpickle()
     return require_grad_params, names
@@ -276,7 +283,7 @@ def inject_trainable_lora_extended(
     if loras is not None:
         loras = torch.load(loras)
 
-    for _module, name, _child_module in _find_modules(
+    for _module, name, _child_module, _fullname in _find_modules(
             model, target_replace_module, search_class=[nn.Linear, nn.Conv2d]
     ):
         if _child_module.__class__ == nn.Linear:
@@ -337,7 +344,7 @@ def extract_lora_ups_down(model, target_replace_module=None):
         target_replace_module = DEFAULT_TARGET_REPLACE
     loras = []
 
-    for _m, _n, _child_module in _find_modules(
+    for _m, _n, _child_module, _fullname in _find_modules(
             model,
             target_replace_module,
             search_class=[LoraInjectedLinear, LoraInjectedConv2d],
@@ -588,7 +595,7 @@ def load_safeloras_both(path, device="cpu"):
 
 
 def collapse_lora(model, alpha=1.0):
-    for _module, name, _child_module in _find_modules(
+    for _module, name, _child_module, _fullname in _find_modules(
             model,
             UNET_EXTENDED_TARGET_REPLACE | TEXT_ENCODER_EXTENDED_TARGET_REPLACE,
             search_class=[LoraInjectedLinear, LoraInjectedConv2d],
@@ -628,7 +635,7 @@ def monkeypatch_or_replace_lora(
 ):
     if target_replace_module is None:
         target_replace_module = DEFAULT_TARGET_REPLACE
-    for _module, name, _child_module in _find_modules(
+    for _module, name, _child_module, _fullname in _find_modules(
             model, target_replace_module, search_class=[nn.Linear, LoraInjectedLinear]
     ):
         _source = (
@@ -674,7 +681,7 @@ def monkeypatch_or_replace_lora_extended(
 ):
     if target_replace_module is None:
         target_replace_module = DEFAULT_TARGET_REPLACE
-    for _module, name, _child_module in _find_modules(
+    for _module, name, _child_module, _fullname in _find_modules(
             model,
             target_replace_module,
             search_class=[nn.Linear, LoraInjectedLinear, nn.Conv2d, LoraInjectedConv2d],
@@ -765,7 +772,7 @@ def monkeypatch_or_replace_safeloras(models, safeloras):
 
 
 def monkeypatch_remove_lora(model):
-    for _module, name, _child_module in _find_modules(
+    for _module, name, _child_module, _fullname in _find_modules(
             model, search_class=[LoraInjectedLinear, LoraInjectedConv2d]
     ):
         if isinstance(_child_module, LoraInjectedLinear):
@@ -811,7 +818,7 @@ def monkeypatch_add_lora(
 ):
     if target_replace_module is None:
         target_replace_module = DEFAULT_TARGET_REPLACE
-    for _module, name, _child_module in _find_modules(
+    for _module, name, _child_module, _fullname in _find_modules(
             model, target_replace_module, search_class=[LoraInjectedLinear]
     ):
         weight = _child_module.linear.weight

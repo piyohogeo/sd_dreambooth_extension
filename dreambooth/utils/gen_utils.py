@@ -56,7 +56,10 @@ def generate_classifiers(
     try:
         status.textinfo = "Preparing dataset..."
         prompt_dataset = ClassDataset(
-            args.concepts(), args.resolution)
+            args.concepts(),
+            args.resolution,
+            args.parameter_weight_tag,
+            args.parameter_prompt_tag)
         instance_prompts = prompt_dataset.instance_prompts
         class_prompts = prompt_dataset.class_prompts
     except Exception as p:

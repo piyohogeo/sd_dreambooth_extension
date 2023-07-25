@@ -26,7 +26,7 @@ _ADAM_BASE_BATCH_SIZE = 4
 
 class DreamboothConfig(BaseModel):
     # These properties MUST be sorted alphabetically
-    adamw_weight_decay: float = 0.01
+    adamw_weight_decay: float = 1.0 - (1.0 - 0.01) ** (1.0 / _ADAM_BASE_BATCH_SIZE)
     adam_beta1: float = 0.9 ** (1.0 / _ADAM_BASE_BATCH_SIZE)
     adam_beta2: float = 0.999 ** (1.0 / _ADAM_BASE_BATCH_SIZE)
     adaptation_beta1: int = 0
@@ -36,6 +36,7 @@ class DreamboothConfig(BaseModel):
     attention: str = "xformers"
     cache_latents: bool = True
     clip_grad_norm: float = 0.0
+    clip_grad_norm_instance: float = 0.0
     clip_skip: int = 1
     concepts_list: List[Dict] = []
     concepts_path: str = ""
@@ -59,6 +60,7 @@ class DreamboothConfig(BaseModel):
     guidance_scale_scheduled_steps: Optional[int] = None
     half_model: bool = False
     instance_loss_weight: float = 1.0
+    instance_loss_sharpness: float = 1.0
     is_loss_count_scale: bool = False
     is_use_emphasis: bool = True
     train_unfrozen: bool = True
@@ -70,12 +72,18 @@ class DreamboothConfig(BaseModel):
     l2_regularization_lambda: float = 1e-5
     l2_regularization_adaptive: bool = False
     l2_regularization_ema_beta: float = 0.05
+    l1_regularization: bool = False
+    l1_regularization_lambda: float = 1e-5
+    l1_regularization_adaptive: bool = False
+    l1_regularization_ema_beta: float = 0.05
     learning_rate: float = 5e-6
     learning_rate_min: float = 1e-6
     lifetime_revision: int = 0
     local_sgd_steps: int = 0
     lora_learning_rate: float = 1e-4
     lora_model_name: str = ""
+    lora_no_train_cross_attention: bool = False
+    lora_no_train_mid: bool = False
     lora_unet_rank: int = 4
     lora_txt_rank: int = 4
     lora_txt_learning_rate: float = 5e-5
@@ -86,6 +94,7 @@ class DreamboothConfig(BaseModel):
     lr_power: float = 1.0
     lr_scale_pos: float = 0.5
     lr_scheduler: str = "constant_with_warmup"
+    lr_scheduler_instance_stanby_step: int = 0
     lr_warmup_steps: int = 0
     max_token_length: int = 75
     mean_batch_count: int = 100
@@ -100,6 +109,8 @@ class DreamboothConfig(BaseModel):
     offset_noise: float = 0
     optimizer: str = "8bit AdamW"
     pad_tokens: bool = True
+    parameter_weight_tag: str = 'TrainingWeight'
+    parameter_prompt_tag: str = 'TrainingTags'
     pretrained_model_name_or_path: str = ""
     pretrained_vae_name_or_path: str = ""
     prior_loss_scale: bool = False
@@ -134,7 +145,9 @@ class DreamboothConfig(BaseModel):
     split_loss: bool = True
     split_optimizer: bool = False
     split_optimizer_without_offset: bool = False
-    split_optimizer_ema: bool = False
+    split_optimizer_use_ema: bool = False
+    split_optimizer_ema_beta: float = 0.999
+    split_optimizer_instance_loss_weight: float = 1.0
     src: str = ""
     stop_text_encoder: float = 1.0
     strict_tokens: bool = False
@@ -142,6 +155,8 @@ class DreamboothConfig(BaseModel):
     train_batch_size: int = 1
     train_imagic: bool = False
     train_unet: bool = True
+    train_loss_sharpness: bool = False
+    train_loss_sharpness_lr_scale: float = 1e-3
     use_concepts: bool = False
     use_ema: bool = True
     use_lora: bool = False

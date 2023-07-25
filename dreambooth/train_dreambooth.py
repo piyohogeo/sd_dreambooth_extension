@@ -87,6 +87,7 @@ from kimuraya.stable_diffusion.model_utils import (
     load_lora_unet,
     load_lora_text_encoder,
     load_from_safetensor)
+from kimuraya.torch_utils import Histgram
 
 logger = logging.getLogger(__name__)
 # define a Handler which writes DEBUG messages or higher to the sys.stderr
@@ -159,21 +160,6 @@ def current_prior_loss(args, current_epoch):
     return prior
 
 
-class Histgram(nn.Module):
-    def __init__(self, bins, bin_width=None):
-        super().__init__()
-        if bin_width is None:
-            bin_width = bins[1] - bins[0]
-        self._bin_width = bin_width
-        self._bins = bins
-        self.tanh = nn.Tanh()
-
-    def forward(self, x):
-        return torch.cat([(torch.mean(
-            0.5 - self.tanh((x - bin_center) / self._bin_width * 2.0)
-            / 2.0)).unsqueeze(0) for bin_center in self._bins])
-
-
 def create_vae(args):
     vae_path = (
         args.pretrained_vae_name_or_path
@@ -224,7 +210,11 @@ def calc_kl_divergence(ps, qs):
 
 
 class ParamStatSave:
-    def __init__(self, epoch, logging_dir):
+    def __init__(self, epoch, logging_dir, is_enabled=False):
+        self._is_enabled = is_enabled
+        if not self._is_enabled:
+            return
+
         self._weights_sum = []
         self._grad2_sum = []
         self._count = 0
@@ -233,6 +223,9 @@ class ParamStatSave:
 
     @torch.no_grad()
     def step(self, params, grads):
+        if not self._is_enabled:
+            return
+
         self._count += 1
         params_cpu = [p.detach().cpu() for p in params]
         grads_cpu = [g.detach().cpu() for g in grads]
@@ -248,7 +241,10 @@ class ParamStatSave:
                                        zip(self._grad2_sum, grads2)))
 
     @torch.no_grad()
-    def epoch_end(self):
+    def _epoch_end(self):
+        if not self._is_enabled:
+            return
+
         weight_means = [weight * (1.0 / self._count)
                         for weight in self._weights_sum]
         grad2_means = [grad2 * (1.0 / self._count)
@@ -257,6 +253,12 @@ class ParamStatSave:
         torch.save({'weight_means': weight_means,
                     'grad2_means': grad2_means},
                    param_path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._epoch_end()
 
 
 class L2Regularization:
@@ -291,6 +293,53 @@ class L2Regularization:
         if self._ema_grad_norm is not None:
             logs.update({
                     "l2_regularization/ema_grad_norm":
+                    float(self._ema_grad_norm.item()),
+                })
+        return loss
+
+    def update_grad_norm(self, grad_norm):
+        if grad_norm is None:
+            self._ema_grad_norm = None
+        elif self._ema_grad_norm is None:
+            self._ema_grad_norm = grad_norm
+        else:
+            self._ema_grad_norm = (self._ema_beta * grad_norm
+                                   + (1.0 - self._ema_beta)
+                                   * self._ema_grad_norm)
+
+
+class L1Regularization:
+    @torch.no_grad()
+    def __init__(self, args):
+        self._enabled = args.l1_regularization
+        self._ema_beta = args.l1_regularization_ema_beta
+        self._adaptive = args.l1_regularization_adaptive
+        self._lambda = args.l1_regularization_lambda
+        self._target_grad_norm = torch.tensor(args.clip_grad_norm)
+        self._ema_grad_norm = None
+        if self._enabled:
+            print('l1_regularization is enabled:',
+                  self._lambda, self._adaptive)
+
+    def calc_loss(self, parameters, logs):
+        if not self._enabled:
+            return torch.tensor(0.0)
+
+        param_l1_norm = sum(
+            [torch.sum(torch.abs(p))
+                for p in parameters])
+        loss = self._lambda * param_l1_norm
+        if self._adaptive and self._ema_grad_norm is not None:
+            loss *= torch.maximum(torch.tensor(1.0),
+                                  self._ema_grad_norm
+                                   / self._target_grad_norm)
+        logs.update({
+                "l1_regularization/param_l1_norm":
+                float(param_l1_norm.detach().item()),
+            })
+        if self._ema_grad_norm is not None:
+            logs.update({
+                    "l1_regularization/ema_grad_norm":
                     float(self._ema_grad_norm.item()),
                 })
         return loss
@@ -386,7 +435,14 @@ def offset_scaled_(dst_ts, src_ts, scale):
 
 
 @torch.no_grad()
-def try_copy(src_ts, dst_ts):
+def offset_scaled_based_(dst_ts, src_ts, base_ts, scale):
+    for d, b, s in zip(dst_ts, base_ts, src_ts):
+        new_d = d + s * scale
+        d.copy_(new_d)
+
+
+@torch.no_grad()
+def try_copy_(src_ts, dst_ts):
     if len(dst_ts) == 0:
         dst_ts.extend([t.detach().clone() for t in src_ts])
     else:
@@ -395,19 +451,29 @@ def try_copy(src_ts, dst_ts):
 
 
 @torch.no_grad()
-def offset_by_grad_(param_grads, prior_grads, logs, is_dry_run=False):
+def try_ema_(src_ts, dst_ts, beta):
+    if len(dst_ts) == 0:
+        dst_ts.extend([t.detach().clone() for t in src_ts])
+    else:
+        for src_t, dst_t in zip(src_ts, dst_ts):
+            dst_t.copy_(dst_t * beta + src_t * (1.0 - beta))
+
+
+@torch.no_grad()
+def offset_by_grad_(param_grads, instance_grads, prior_grads, logs, is_dry_run=False):
     with torch.no_grad():
-        grads_dot = dot_all_tensors(param_grads, prior_grads)
+        grads_dot = dot_all_tensors(instance_grads, prior_grads)
+        instance_grads_norm = norm_all_tensors(instance_grads)
         param_grads_norm = norm_all_tensors(param_grads)
         prior_grads_norm = norm_all_tensors(prior_grads)
         grads_cos = torch.minimum(grads_dot
-                                  / (param_grads_norm * prior_grads_norm),
+                                  / (instance_grads_norm * prior_grads_norm),
                                   torch.tensor(0.0))
         if not is_dry_run:
-            offset_coef = -grads_cos * param_grads_norm / prior_grads_norm
+            offset_coef = -grads_cos * instance_grads_norm / prior_grads_norm
             offset_scaled_(param_grads, prior_grads, offset_coef)
             offseted_param_grads_norm = norm_all_tensors(param_grads)
-            offseted_grads_dot = dot_all_tensors(param_grads, prior_grads)
+            # offseted_grads_dot = dot_all_tensors(param_grads, prior_grads)
         logs.update({
                 "grads_dot":
                 float(grads_dot.item()),
@@ -419,8 +485,8 @@ def offset_by_grad_(param_grads, prior_grads, logs, is_dry_run=False):
             })
         if not is_dry_run:
             logs.update({
-                    "offseted_grads_dot":
-                    float(offseted_grads_dot.item()),
+                    # "offseted_grads_dot":
+                    # float(offseted_grads_dot.item()),
                     "inst/offseted_grads_norm":
                     float(offseted_param_grads_norm.item()),
                 })
@@ -437,6 +503,152 @@ def sequential_do(accelerator: Accelerator):
 
 def sequential_print(accelerator, *args, **kwargs):
     sequential_do(accelerator)(print)(*args, **kwargs)
+
+
+class GradModifier:
+    def __init__(self, args, is_save_process=False, ema_beta=0.99):
+        self._is_save_process = is_save_process
+        self.args = args
+        self._prior_grads = []
+        self._instance_grads = []
+        self._ema_prior_grads = []
+        self._ema_instance_grads = []
+        self._ema_beta = ema_beta
+
+    @torch.no_grad()
+    def _save_params(self, filename, params, param_grads):
+        if self._is_save_process:
+            torch.save(
+                (params, param_grads),
+                os.path.join(
+                    self.args.model_dir,
+                    'logging',
+                    filename))
+
+    def modify_grads(self,
+                     params,
+                     param_grads,
+                     is_instance_batch,
+                     counter,
+                     logs):
+        def save_params(filename):
+            self._save_params(filename, params, param_grads)
+
+        if self.args.split_optimizer:
+            file_name_prefix = ('instance_'
+                                if is_instance_batch
+                                else 'prior_')
+        else:
+            file_name_prefix = ''
+        if self.args.save_params_step:
+            save_params(
+                f'{file_name_prefix}params_{counter.epoch}'
+                f'_{counter.step}.pt')
+
+        if self.args.split_optimizer:
+            if is_instance_batch:
+                if self.args.split_optimizer_use_ema:
+                    try_ema_(param_grads,
+                             self._ema_instance_grads,
+                             self._ema_beta)
+            else:
+                if self.args.split_optimizer_use_ema:
+                    try_ema_(param_grads,
+                             self._ema_prior_grads,
+                             self._ema_beta)
+                else:
+                    try_copy_(param_grads, self._prior_grads)
+
+            if self.args.split_optimizer_use_ema:
+                instance_grads = self._ema_instance_grads
+                prior_grads = self._ema_prior_grads
+            else:
+                instance_grads = param_grads
+                prior_grads = self._prior_grads
+
+            if (is_instance_batch
+                    and len(instance_grads) > 0
+                    and len(prior_grads) > 0):
+                if self.args.split_optimizer_without_offset:
+                    if on_first_call():
+                        print('split_optimizer/offset_by_grad_ is dry_run')
+                offset_by_grad_(
+                    param_grads,
+                    instance_grads,
+                    prior_grads,
+                    logs,
+                    is_dry_run=self.args.split_optimizer_without_offset)
+
+
+class LoopCounter:
+    def __init__(self, args, max_epochs, step_increment,
+                 max_train_steps=0, global_step=0, is_progress_bar=False):
+        self.args = args
+        self._max_epochs = max_epochs
+        self._step_increment = step_increment
+
+        self.epoch = 0
+        self.global_step = global_step
+        self.step = 0
+
+        self._progress_bar = mytqdm(
+            range(max_train_steps),
+            disable=not is_progress_bar,
+            position=0,
+        )
+        self._progress_bar.set_description("Steps")
+        self._progress_bar.set_postfix(refresh=True)
+
+    def __iter__(self):
+        self._next_epoch = 0
+        self._init_args_epoch = self.args.epoch
+        return self
+
+    def __next__(self):
+        self.epoch = self._next_epoch
+        if self.epoch >= self._max_epochs:
+            raise StopIteration()
+
+        self._progress_bar.set_postfix({'epoch': self.epoch})
+        self.step = 0
+        self.args.epoch = self._init_args_epoch + self.epoch
+        self._next_epoch += 1
+        return self.epoch
+
+    def __len__(self):
+        return self._max_epochs
+
+    @contextlib.contextmanager
+    def step_context(self):
+        self.args.revision += self._step_increment
+        try:
+            yield
+        finally:
+            self.step += self._step_increment
+            self.global_step += self._step_increment
+            self._progress_bar.update(self._step_increment)
+
+
+def unwrap_model(model):
+    return getattr(model, 'module', model)
+
+
+class SharpLoss(nn.Module):
+    def __init__(self, ema_beta=0.999):
+        super().__init__()
+        self.shaprness_diff = nn.Parameter(torch.tensor(0.0))
+        self.mean = torch.tensor(0.16)
+        self._ema_beta = ema_beta
+
+    def forward(self, x):
+        self._step_update_mean(x.detatch())
+        return 1.0 / (self.mean * (x / self.mean).pow(self._shaprness_diff + 1.0))
+
+    def get_sharpness(self):
+        return self.shaprness_diff + 1.0
+
+    def _step_update_mean(self, new_mean):
+        self.mean = self._ema_beta * self.mean + (1.0 - self._ema_beta) * new_mean
 
 
 class OptimizerLoop:
@@ -512,6 +724,8 @@ class OptimizerLoop:
         max_train_steps = (self.args.num_train_epochs
                            * len(self.train_dataloader)
                            * self._total_batch_size)
+        if 'SAM' in self.args.optimizer:
+            max_train_steps *= 2
 
         max_train_epochs = self.args.num_train_epochs
         # we calculate our number of tenc training epochs
@@ -792,9 +1006,11 @@ class OptimizerLoop:
         if self.args.use_lora:
             if (self.args.lora_model_name
                     and '.pt' in self.args.lora_model_name):
-                lora_path = os.path.join(self.args.model_dir,
-                                         "loras",
-                                         self.args.lora_model_name)
+                # lora_path = os.path.join(self.args.model_dir,
+                #                          "loras",
+                #                          self.args.lora_model_name)
+                self.accelerator.print(f'load lora from .pt in {self.args.lora_model_name}')
+                lora_path = self.args.lora_model_name
                 lora_txt = lora_path.replace(".pt", "_txt.pt")
 
                 if (not os.path.exists(lora_path)
@@ -807,11 +1023,18 @@ class OptimizerLoop:
             target_module = get_target_module(
                 "module", self.args.use_lora_extended)
 
-            unet_lora_params, _ = injectable_lora(
+            if self.args.lora_no_train_mid:
+                no_train_keywords = ['mid']
+            elif self.args.lora_no_train_cross_attention:
+                no_train_keywords = ['attn2']
+            else:
+                no_train_keywords = []
+            unet_lora_params, unet_lora_names = injectable_lora(
                 self.unet,
                 r=self.args.lora_unet_rank,
                 loras=lora_path,
                 target_replace_module=target_module,
+                no_train_keywords=no_train_keywords,
             )
 
             def flatten_parameters(ps):
@@ -835,7 +1058,9 @@ class OptimizerLoop:
                     text_encoder_lora_params)
 
             def load_lora_weights():
+                self.accelerator.print(f'load lora from safetensors in {self.args.lora_model_name}')
                 lora_tensors = load_from_safetensor(self.args.lora_model_name)
+                self.accelerator.print(f'tensor len: {len(lora_tensors)}')
                 load_lora_unet(self.unet, lora_tensors)
                 load_lora_text_encoder(self.text_encoder, lora_tensors)
 
@@ -878,43 +1103,67 @@ class OptimizerLoop:
                 self.args.adam_beta2 ** scaling_factor)
             print('-> adam_beta1: ', adam_betas[0])
             print('-> adam_beta2: ', adam_betas[1])
+            print('Adam weight decay are scaled by num_processes '
+                  '* gradient_accumulation_steps')
+            print('adamw_weight_decay: ', self.args.adamw_weight_decay)
+            adamw_weight_decay = 1.0 - (1.0 - self.args.adamw_weight_decay) ** scaling_factor
+            print('-> adamw_weight_decay: ', adamw_weight_decay)
         else:
             learning_rate = self.args.learning_rate
             adam_betas = (self.args.adam_beta1, self.args.adam_beta2)
+            adamw_weight_decay = self.args.adamw_weight_decay
+
+        if self.args.train_loss_sharpness:
+            self.trainable_loss_sharpness = SharpLoss()
 
         def build_params_to_optimize(lr_scale=1.0):
-            if self.args.use_lora:
-                if self._any_train_tenc:
-                    return [
-                        {
-                            "params": unet_lora_params,
-                            "lr": lora_learning_rate * lr_scale,
-                            "betas": adam_betas,
-                        },
-                        {
-                            "params": text_encoder_lora_params,
-                            "lr": lora_txt_learning_rate * lr_scale,
-                            "betas": adam_betas,
-                        },
-                    ]
+            def _build_params_to_optimize():
+                if self.args.use_lora:
+                    if self._any_train_tenc:
+                        return [
+                            {
+                                "params": unet_lora_params,
+                                "lr": lora_learning_rate * lr_scale,
+                                "betas": adam_betas,
+                                'weight_decay': adamw_weight_decay,
+                            },
+                            {
+                                "params": text_encoder_lora_params,
+                                "lr": lora_txt_learning_rate * lr_scale,
+                                "betas": adam_betas,
+                                'weight_decay': adamw_weight_decay,
+                            },
+                        ]
+                    else:
+                        params_to_optimize = unet_lora_params
+                elif self._any_train_tenc:
+                    if self.args.train_unet:
+                        params_to_optimize = itertools.chain(
+                            self.unet.parameters(), self.text_encoder.parameters())
+                    else:
+                        params_to_optimize = itertools.chain(
+                            self.text_encoder.parameters())
                 else:
-                    params_to_optimize = unet_lora_params
-            elif self._any_train_tenc:
-                if self.args.train_unet:
-                    params_to_optimize = itertools.chain(
-                        self.unet.parameters(), self.text_encoder.parameters())
-                else:
-                    params_to_optimize = itertools.chain(
-                        self.text_encoder.parameters())
-            else:
-                params_to_optimize = self.unet.parameters()
-            return [
-                {
-                    "params": params_to_optimize,
-                    "lr": learning_rate * lr_scale,
+                    params_to_optimize = self.unet.parameters()
+                return [
+                    {
+                        "params": params_to_optimize,
+                        "lr": learning_rate * lr_scale,
+                        "betas": adam_betas,
+                        'weight_decay': adamw_weight_decay,
+                    }
+                ]
+            param_groups = _build_params_to_optimize()
+            if self.args.train_loss_sharpness:
+                param_groups.append({
+                    "params": self.trainable_loss_sharpness,
+                    "lr": (learning_rate
+                           * self.args.train_loss_sharpness_lr_scale
+                           * lr_scale),
                     "betas": adam_betas,
-                }
-            ]
+                    'weight_decay': adamw_weight_decay,
+                })
+            return param_groups
 
         self.optimizer, self._optimizer_kwargs = get_optimizer(
             self.args, build_params_to_optimize())
@@ -1087,6 +1336,8 @@ class OptimizerLoop:
         if self.args.split_optimizer:
             to_prepare_objects.extend([self.instance_optimizer,
                                        self.instance_lr_scheduler])
+        if self.args.train_loss_sharpness:
+            to_prepare_objects.append(self.trainable_loss_sharpness)
         optimizer_type = type(self.optimizer)
 
         prepared_objects = self.accelerator.prepare(*to_prepare_objects)
@@ -1120,6 +1371,8 @@ class OptimizerLoop:
         if self.args.split_optimizer:
             self.instance_optimizer, self.instance_lr_scheduler, *rs = rs
             self.instance_optimizer = sam_optimizer(self.instance_optimizer)
+        if self.args.train_loss_sharpness:
+            self.trainable_loss_sharpness, *rs = rs
         assert rs == []
 
         self.train_dataloader = self.accelerator.prepare_data_loader(
@@ -1266,12 +1519,9 @@ class OptimizerLoop:
             pred = noise_pred
         return pred
 
-    def _loss_fn(self, xs, ys, prod, is_instance,
-                 kl_loss_gain=1.0, is_use_noise_prod_loss=False):
-        prod = (prod if is_use_noise_prod_loss
-                else torch.ones_like(prod))
-
-        def loss_fun_batch(x, y, p):
+    def _loss_fn(self, xs, ys, is_instance,
+                 kl_loss_gain=1.0):
+        def loss_fun_batch(x, y):
             if ('instance_sqrt_mse' in self.args.loss_function_method
                     and is_instance):
                 epsilon = 1e-4
@@ -1279,15 +1529,35 @@ class OptimizerLoop:
                     print('instance_sqrt_mse in',
                           self.args.loss_function_method,
                           is_instance)
-                return p * torch.sqrt(torch.nn.functional.mse_loss(
+                return torch.sqrt(torch.nn.functional.mse_loss(
                     xs.float(), ys.float(), reduction="mean"
                 ) + epsilon)
+            elif ('instance_inverse_mse' in self.args.loss_function_method
+                    and is_instance):
+                epsilon = 1e-2
+                if on_first_call():
+                    print('instance_inverse_mse in',
+                          self.args.loss_function_method,
+                          is_instance)
+                if self.args.train_loss_sharpness:
+                    return self.trainable_loss_sharpness(
+                        torch.nn.functional.mse_loss(
+                            xs.float(), ys.float(), reduction="mean"
+                        ) + epsilon)
+                else:
+                    if self.args.instance_loss_sharpness != 1.0:
+                        if on_first_call():
+                            print('instance_loss_sharpness:',
+                                  self.args.instance_loss_sharpness)
+                    return 1.0 / (torch.nn.functional.mse_loss(
+                        xs.float(), ys.float(), reduction="mean"
+                    ) + epsilon).pow(self.args.instance_loss_sharpness)
             if 'instance_l1' in self.args.loss_function_method and is_instance:
                 if on_first_call():
                     print('instance_l1 in',
                           self.args.loss_function_method,
                           is_instance)
-                return p * torch.nn.functional.l1_loss(
+                return torch.nn.functional.l1_loss(
                     xs.float(), ys.float(), reduction="mean"
                 )
             elif ('instance_smoothl1sqrtmse' in self.args.loss_function_method
@@ -1299,7 +1569,7 @@ class OptimizerLoop:
                         torch.nn.functional.mse_loss(
                             xs.float(), ys.float(), reduction="mean"))
                 beta = 1.0
-                return p * 2.0 * beta * torch.nn.functional.smooth_l1_loss(
+                return 2.0 * beta * torch.nn.functional.smooth_l1_loss(
                     sqrt_mse, torch.zeros_like(sqrt_mse), beta=beta
                 )
             elif ('instance_smoothl1' in self.args.loss_function_method
@@ -1307,7 +1577,7 @@ class OptimizerLoop:
                 if on_first_call():
                     print('instance_smoothl1 in',
                           self.args.loss_function_method, is_instance)
-                return p * torch.nn.functional.smooth_l1_loss(
+                return torch.nn.functional.smooth_l1_loss(
                     xs.float(), ys.float(), reduction="mean", beta=1.0
                 )
             elif 'kl' in self.args.loss_function_method:
@@ -1321,14 +1591,14 @@ class OptimizerLoop:
                     return torch.mean(torch.stack(
                         [calc_kl_divergence(ps.float(), qs.float())
                          for ps, qs in zip(pss, qss)]))
-                return kl_loss_gain * p * kl_loss(x, y)
+                return kl_loss_gain * kl_loss(x, y)
             elif ('class_sqrt_mse' in self.args.loss_function_method
                   and not is_instance):
                 epsilon = 1e-4
                 if on_first_call():
                     print('class_sqrt_mse in',
                           self.args.loss_function_method, is_instance)
-                return p * torch.sqrt(torch.nn.functional.mse_loss(
+                return torch.sqrt(torch.nn.functional.mse_loss(
                     xs.float(), ys.float(), reduction="mean"
                 ) + epsilon)
             elif ('class_l1' in self.args.loss_function_method
@@ -1337,22 +1607,21 @@ class OptimizerLoop:
                 if on_first_call():
                     print('class_l1 in',
                           self.args.loss_function_method, is_instance)
-                return p * torch.nn.functional.l1_loss(
+                return torch.nn.functional.l1_loss(
                     xs.float(), ys.float(), reduction="mean")
             if on_first_call():
                 print('default loss mse', is_instance)
-            return p * torch.nn.functional.mse_loss(
+            return torch.nn.functional.mse_loss(
                 xs.float(), ys.float(), reduction="mean"
             )
-        batched_loss = torch.stack([loss_fun_batch(x, y, p)
-                                    for x, y, p in zip(xs, ys, prod)])
+        batched_loss = torch.stack([loss_fun_batch(x, y)
+                                    for x, y in zip(xs, ys)])
         assert batched_loss.shape[0] == xs.shape[0]
         assert batched_loss.shape[0] == ys.shape[0]
-        assert batched_loss.shape[0] == prod.shape[0]
-        return torch.sum(batched_loss)
+        return torch.mean(batched_loss)
 
     def _extract_optimizer_parameters(self, is_check_grad=False):
-        extract_optimizer_parameters(self.optimizer, is_check_grad)
+        return extract_optimizer_parameters(self.optimizer, is_check_grad)
 
     class NoSyncParametersPseudoModel:
         def __init__(self, parameters, no_sync_models):
@@ -1370,23 +1639,18 @@ class OptimizerLoop:
                         stack.enter_context(model.no_sync())
                 yield
 
-    def _clip_grad_norm(self, train_tenc, logs):
+    def _clip_grad_norm(self, logs, is_instance_batch):
         if self.args.clip_grad_norm == 0.0:
             return None
 
-        if self.args.use_lora:
-            params_to_clip = self._extract_optimizer_parameters()
-            cliped_grad_norm = self.accelerator.clip_grad_norm_(
-                params_to_clip,
-                self.args.clip_grad_norm)
+        if is_instance_batch and self.args.clip_grad_norm_instance != 0.0:
+            clip_grad_norm = self.args.clip_grad_norm_instance
         else:
-            if train_tenc:
-                params_to_clip = itertools.chain(
-                    self.unet.parameters(), self.text_encoder.parameters())
-            else:
-                params_to_clip = self.unet.parameters()
-            cliped_grad_norm = self.accelerator.clip_grad_norm_(
-                params_to_clip, self.args.clip_grad_norm)
+            clip_grad_norm = self.args.clip_grad_norm
+        params_to_clip = self._extract_optimizer_parameters()
+        cliped_grad_norm = self.accelerator.clip_grad_norm_(
+            params_to_clip,
+            clip_grad_norm)
         logs.update({
                 "cliped_grad_norm":
                 float(cliped_grad_norm.item()),
@@ -1423,7 +1687,7 @@ class OptimizerLoop:
                       guidance_scale_at_step)
         return guidance_scale_at_step
 
-    def _calc_embeds(self, batch, train_tenc):
+    def _calc_embeds(self, batch):
         if on_first_call():
             for prompt, negative_prompt in zip(
                     batch['prompt'], batch['negative_prompt']):
@@ -1443,7 +1707,6 @@ class OptimizerLoop:
                     self.accelerator.device)
             else:
                 embeds = build_embd_from_prompt_original(
-                    train_tenc,
                     self.args,
                     self.text_encoder,
                     self.tokenizer,
@@ -1552,33 +1815,29 @@ class OptimizerLoop:
     def _split_outputs(self,
                        pred,
                        target,
-                       noise_prods,
                        is_priors):
         def filter_chunk(is_prior):
             xss = list(zip(*[xs for xs
                              in zip(pred,
                                     target,
-                                    noise_prods,
                                     is_priors)
                              if is_prior == xs[-1]]))
             if len(xss) > 0:
                 return tuple(map(torch.stack, xss[:-1]))
             else:
-                return tuple([None] * 3)
-        (model_pred_instance,
-         _,
-         _) = instance_chunks = filter_chunk(False)
-        (model_pred_prior,
-         _,
-         _) = prior_chunks = filter_chunk(True)
+                return None
+        instance_chunks = filter_chunk(False)
+        prior_chunks = filter_chunk(True)
 
         assert pred.shape[0] == self._train_batch_size
         assert target.shape[0] == self._train_batch_size
         if self.dataset_interleave_size >= self._train_batch_size:
-            assert (model_pred_instance is None
-                    or model_pred_prior is None)
+            assert (instance_chunks is None
+                    or prior_chunks is None)
         else:
-            assert len(model_pred_instance) == len(model_pred_prior)
+            if instance_chunks is None or prior_chunks is None:
+                print('is_priors', is_priors)
+            assert len(instance_chunks[0]) == len(prior_chunks[0])
 
         return instance_chunks, prior_chunks
 
@@ -1660,6 +1919,15 @@ class OptimizerLoop:
                 )
             return save_model
 
+    def _build_timesteps(self):
+        timesteps = torch.randint(
+            0,
+            self.noise_scheduler.config.num_train_timesteps,
+            (self._train_batch_size,),
+            device=self.accelerator.device,
+        ).long()
+        return timesteps
+
     def _bulid_noise(self, latents):
         if self.args.offset_noise < 0:
             noise = torch.randn_like(latents,
@@ -1676,112 +1944,40 @@ class OptimizerLoop:
             )
         return noise
 
+    class NullStepable:
+        def __init__(self):
+            pass
+
+        def step(self, *_, **__):
+            pass
+
     def _optimizer_step(self,
                         is_instance_batch,
                         is_first_step, is_second_step):
         optimizer = (self.instance_optimizer
                      if self.args.split_optimizer and is_instance_batch
                      else self.optimizer)
-        lr_scheduler = (self.instance_lr_scheduler
-                     if self.args.split_optimizer and is_instance_batch
-                     else self.lr_scheduler)
+        if self.args.split_optimizer and is_instance_batch:
+            if self._lr_scheduler_instance_stanby_step_rest > 0:
+                self._lr_scheduler_instance_stanby_step_rest -= 1
+                lr_scheduler = self.NullStepable()
+            else:
+                lr_scheduler = self.instance_lr_scheduler
+        else:
+            lr_scheduler = self.lr_scheduler
+
         if is_first_step:
             optimizer.first_step()
         elif is_second_step:
             optimizer.second_step()
             lr_scheduler.step()
+            optimizer.zero_grad(
+                set_to_none=self.args.gradient_set_to_none)
         else:
             optimizer.step()
             lr_scheduler.step()
-
-    class GradModifier:
-        def __init__(self, args, accelerator):
-            self.accelerator = accelerator
-            self.args = args
-            self._prior_grads = []
-            self._instance_grads = []
-            self._ema_prior_grad_norms = []
-            self._ema_instance_grad_norms = []
-            self._ema_beta = 0.01
-
-        @torch.no_grad()
-        def _save_params(self, filename, params, param_grads):
-            if self.accelerator.is_main_process:
-                torch.save(
-                    (params, param_grads),
-                    os.path.join(
-                        self.args.model_dir,
-                        'logging',
-                        filename))
-
-        def modify_grads(self,
-                         params,
-                         param_grads,
-                         is_instance_batch,
-                         counter,
-                         logs):
-            def save_params(filename):
-                self._save_params(filename, params, param_grads)
-
-            if self.args.split_optimizer:
-                file_name_prefix = ('instance_'
-                                    if is_instance_batch
-                                    else 'prior_')
-            else:
-                file_name_prefix = ''
-            if self.args.save_params_step:
-                save_params(
-                    f'{file_name_prefix}params_{counter.epoch}'
-                    f'_{counter.step}.pt')
-
-            if self.args.split_optimizer:
-                if is_instance_batch:
-                    pass
-                    # try_copy(param_grads, self._instance_grads)
-                else:
-                    try_copy(param_grads, self._prior_grads)
-
-                if (is_instance_batch
-                        and len(param_grads) > 0
-                        and len(self._prior_grads) > 0):
-                    if self.args.split_optimizer_without_offset:
-                        if on_first_call():
-                            print('split_optimizer/offset_by_grad_ is dry_run')
-                    offset_by_grad_(
-                        param_grads,
-                        self._prior_grads,
-                        logs,
-                        is_dry_run=self.args.split_optimizer_without_offset)
-
-    class LoopCounter:
-        def __init__(self, args, max_epochs, step_increment, global_step=0):
-            self.args = args
-            self._max_epochs = max_epochs
-            self._step_increment = step_increment
-
-            self.epoch = 0
-            self.global_step = global_step
-            self.step = 0
-
-        def __iter__(self):
-            init_args_epoch = self.args.epoch
-            for epoch in range(self._max_epochs):
-                self.step = 0
-                self.epoch = epoch
-                self.args.epoch = init_args_epoch + epoch
-                yield epoch
-
-        def __len__(self):
-            return self._max_epochs
-
-        @contextlib.contextmanager
-        def step_context(self):
-            self.args.revision += self._step_increment
-            try:
-                yield
-            finally:
-                self.step += self._step_increment
-                self.global_step += self._step_increment
+            optimizer.zero_grad(
+                set_to_none=self.args.gradient_set_to_none)
 
     def _fetch_latents(self, batch):
         def maybe_encode(maybe_latent):
@@ -1797,6 +1993,22 @@ class OptimizerLoop:
                                in batch["images"]])
         return latents
 
+    def _set_model_train(self, train_tenc):
+        if self.args.train_unet:
+            self.unet.train()
+
+        if self.args.freeze_clip_normalization:
+            self.text_encoder.eval()
+        else:
+            self.text_encoder.train(train_tenc)
+
+        if not self.args.use_lora:
+            self.text_encoder.requires_grad_(train_tenc)
+        elif train_tenc:
+            # access DDP sub module
+            unwrap_model(self.text_encoder).text_model\
+                    .embeddings.requires_grad_(True)
+
     class TrainingCompleteException(Exception):
         def __init__(self):
             pass
@@ -1808,6 +2020,12 @@ class OptimizerLoop:
                     null_guidance_scale=0.0,
                     fft_method=None,
                     train_steps=100):
+
+        self._lr_scheduler_instance_stanby_step_rest = (
+            self.args.lr_scheduler_instance_stanby_step)
+        # Get the target for loss depending on the prediction type
+        assert (self.noise_scheduler.config.prediction_type
+                != "v_prediction")
 
         @contextlib.contextmanager
         def slave_sync(model):
@@ -1830,19 +2048,8 @@ class OptimizerLoop:
         if self.accelerator.is_main_process:
             self.accelerator.init_trackers("dreambooth")
 
-        save_checker = self.SaveChecker(self.args, self, max_train_epochs)
-
         # for debug?
         # os.environ.__setattr__("CUDA_LAUNCH_BLOCKING", 1)
-
-        # Only show the progress bar once on each machine.
-        progress_bar = mytqdm(
-            range(max_train_steps),
-            disable=not self.accelerator.is_local_main_process,
-            position=0,
-        )
-        progress_bar.set_description("Steps")
-        progress_bar.set_postfix(refresh=True)
         self.args.revision = (
             self.args.revision if isinstance(self.args.revision, int) else
             int(self.args.revision) if str(self.args.revision).strip() else
@@ -1852,10 +2059,6 @@ class OptimizerLoop:
         status.job_no = 0
         msg = ""
 
-        last_tenc = 0 < text_encoder_epochs
-        if not self._any_train_tenc:
-            last_tenc = False
-
         self.noise_scheduler.set_timesteps(
             train_steps, device=self.accelerator.device)
 
@@ -1863,180 +2066,134 @@ class OptimizerLoop:
             self._build_hist()
 
         l2_regularization = L2Regularization(self.args)
+        l1_regularization = L1Regularization(self.args)
         ewc = EWC(self.args, self.accelerator.device)
 
-        counter = self.LoopCounter(
-            self.args, max_train_epochs, self._total_batch_size)
-        grad_modifier = self.GradModifier(self.args, self.accelerator)
-        for epoch in counter:
-            if self.args.num_train_epochs > 1:
-                if epoch >= max_train_epochs:
-                    raise self.TrainingCompleteException()
+        counter = LoopCounter(
+            self.args, max_train_epochs, self._total_batch_size,
+            max_train_steps=max_train_steps,
+            is_progress_bar=self.accelerator.is_local_main_process)
+        grad_modifier = GradModifier(
+            self.args,
+            self.accelerator.is_main_process,
+            ema_beta=(self.args.split_optimizer_ema_beta
+                      ** (self._total_batch_size
+                          * self._gradient_accumulation_steps)))
 
-            if self.accelerator.is_main_process:
-                save_checker.checked_save(
-                    counter.epoch,
-                    is_epoch_check=True)
+        def loop_step(batch,
+                      latents, timesteps, noise,
+                      param_stat_save,
+                      is_first_step=False,
+                      is_second_step=False):
+            logs = {}
+            # Add noise to the latents according
+            # to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_latents = self.noise_scheduler.add_noise(
+                latents, noise, timesteps)
 
-            if self.args.train_unet:
-                self.unet.train()
+            encoder_hidden_states_input = self._calc_embeds(batch)
 
-            train_tenc = epoch < text_encoder_epochs
-            if not self._any_train_tenc:
-                train_tenc = False
+            (noise_pred_uncond,
+                noise_pred_text,
+                noise_pred_uncond_null,
+                noise_pred_output_reference) =\
+                self._calc_unet(noisy_latents,
+                                timesteps,
+                                encoder_hidden_states_input)
 
-            if self.args.freeze_clip_normalization:
-                self.text_encoder.eval()
+            guidance_scale_at_step = self._calc_guidance_scale(
+                counter.global_step, batch)
+
+            noise_pred = (noise_pred_uncond
+                          + guidance_scale_at_step
+                          * (noise_pred_text - noise_pred_uncond))
+
+            reference_stats = self._calc_reference_stat(
+                noise,
+                noise_pred_output_reference,
+                guidance_scale_at_step)
+
+            target = self._calc_target(
+                noise,
+                noise_pred_uncond,
+                noise_pred_uncond_null,
+                latents,
+                guidance_scale_at_step,
+                null_guidance_scale,
+                fft_method,
+                **reference_stats)
+
+            pred = self._calc_pred(noise_pred,
+                                   latents,
+                                   noisy_latents,
+                                   timesteps)
+            assert pred.shape == target.shape
+            assert self.args.split_loss
+            (instance_outputs,
+                prior_outputs) = self._split_outputs(pred,
+                                                     target,
+                                                     batch['types'])
+            is_instance_batch = instance_outputs is not None
+            is_prior_batch = prior_outputs is not None
+            # Concatenate the chunks in instance_chunks
+            # to form the model_pred_instance tensor
+            if is_instance_batch:
+                instance_loss = self._loss_fn(*instance_outputs, True)
+                logs.update({
+                        "inst/loss":
+                        float(instance_loss.detach().item()),
+                    })
             else:
-                self.text_encoder.train(train_tenc)
+                instance_loss = torch.tensor(0.0)
 
-            if not self.args.use_lora:
-                self.text_encoder.requires_grad_(train_tenc)
-            elif train_tenc:
-                # access DDP sub module
-                if hasattr(self.text_encoder, 'module'):
-                    self.text_encoder.module.text_model\
-                        .embeddings.requires_grad_(True)
-                else:
-                    self.text_encoder.text_model\
-                        .embeddings.requires_grad_(True)
+            if is_prior_batch:
+                prior_loss = self._loss_fn(*prior_outputs, False)
+                logs.update({
+                        "prior/loss":
+                        float(prior_loss.detach().item()),
+                    })
+            else:
+                prior_loss = torch.tensor(0.0)
 
-            if last_tenc != train_tenc:
-                last_tenc = train_tenc
-                cleanup()
-
-            loss_total = 0
+            instance_loss_weight = (
+                (np.sign(self.args.instance_loss_weight)
+                 * self.args.split_optimizer_instance_loss_weight)
+                if self.args.split_optimizer
+                else self.args.instance_loss_weight)
 
             current_prior_loss_weight = current_prior_loss(
-                self.args, current_epoch=epoch
+                self.args, current_epoch=counter.epoch
             )
+            loss = (instance_loss_weight * instance_loss
+                    + current_prior_loss_weight * prior_loss)
 
-            param_stat_save = ParamStatSave(
-                os.path.join(self.args.model_dir, 'logging'),
-                epoch) if self.args.save_params_stat else None
+            loss += l2_regularization.calc_loss(
+                self._extract_optimizer_parameters(),
+                logs)
 
-            def loop_step(counter, batch,
-                          latents, timesteps, noise,
-                          is_first_step=False,
-                          is_second_step=False):
-                logs = {}
-                # Add noise to the latents according
-                # to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = self.noise_scheduler.add_noise(
-                    latents, noise, timesteps)
+            loss += l1_regularization.calc_loss(
+                self._extract_optimizer_parameters(),
+                logs)
 
-                encoder_hidden_states_input =\
-                    self._calc_embeds(batch, train_tenc)
+            loss += ewc.calc_loss(
+                self._extract_optimizer_parameters(),
+                logs)
 
-                (noise_pred_uncond,
-                    noise_pred_text,
-                    noise_pred_uncond_null,
-                    noise_pred_output_reference) =\
-                    self._calc_unet(
-                        noisy_latents,
-                        timesteps,
-                        encoder_hidden_states_input
-                    )
+            self.accelerator.backward(loss)
 
-                guidance_scale_at_step = self._calc_guidance_scale(
-                    counter.global_step, batch)
-
-                noise_pred = (noise_pred_uncond
-                              + guidance_scale_at_step
-                              * (noise_pred_text - noise_pred_uncond))
-
-                reference_stats = self._calc_reference_stat(
-                    noise,
-                    noise_pred_output_reference,
-                    guidance_scale_at_step)
-
-                # Get the target for loss depending on the prediction type
-                assert (self.noise_scheduler.config.prediction_type
-                        != "v_prediction")
-                target = self._calc_target(
-                    noise,
-                    noise_pred_uncond,
-                    noise_pred_uncond_null,
-                    latents,
-                    guidance_scale_at_step,
-                    null_guidance_scale,
-                    fft_method,
-                    **reference_stats,
-                    )
-
-                pred = self._calc_pred(
-                            noise_pred,
-                            latents,
-                            noisy_latents,
-                            timesteps,
-                            )
-                assert pred.shape == target.shape
-
-                prev_ts = self.noise_scheduler.previous_timestep(timesteps)
-                noise_prods = self.noise_scheduler.calc_noise_prod(prev_ts)
-
-                assert self.args.split_loss
-                (instance_outputs,
-                 prior_outputs) = self._split_outputs(
-                  pred,
-                  target,
-                  noise_prods,
-                  batch['types'])
-                is_instance_batch = instance_outputs[0] is not None
-                is_prior_batch = prior_outputs[0] is not None
-                # Concatenate the chunks in instance_chunks
-                # to form the model_pred_instance tensor
-                if is_instance_batch:
-                    instance_loss = self._loss_fn(
-                        *instance_outputs,
-                        True)
-                    logs.update({
-                            "inst/loss":
-                            float(instance_loss.detach().item()),
-                        })
+            if self.accelerator.sync_gradients:
+                if (self.args.split_optimizer
+                        or self.args.save_params_step
+                        or self.args.save_params_stat):
+                    params = self._extract_optimizer_parameters(True)
+                    param_grads = [p.grad for p in params]
+                    param_stat_save.step(params, param_grads)
                 else:
-                    instance_loss = torch.tensor(0.0)
+                    params = None
+                    param_grads = None
 
-                if is_prior_batch:
-                    prior_loss = self._loss_fn(
-                        *prior_outputs,
-                        False)
-                    logs.update({
-                            "prior/loss":
-                            float(prior_loss.detach().item()),
-                        })
-                else:
-                    prior_loss = torch.tensor(0.0)
-
-                instance_loss_weight = (np.sign(self.args.instance_loss_weight)
-                                        if self.args.split_optimizer
-                                        else self.args.instance_loss_weight)
-                loss = (instance_loss_weight * instance_loss
-                        + current_prior_loss_weight * prior_loss)
-
-                loss += l2_regularization.calc_loss(
-                    self._extract_optimizer_parameters(),
-                    logs)
-
-                loss += ewc.calc_loss(
-                    self._extract_optimizer_parameters(),
-                    logs)
-
-                self.accelerator.backward(loss)
-
-                if self.accelerator.sync_gradients:
-                    if (self.args.split_optimizer
-                            or self.args.save_params_step
-                            or self.args.save_params_stat):
-                        params = self._extract_optimizer_parameters(True)
-                        param_grads = [p.grad for p in params]
-                        if param_stat_save is not None:
-                            param_stat_save.step(params, param_grads)
-                    else:
-                        params = None
-                        param_grads = None
-
+                if not is_first_step:
                     grad_modifier.modify_grads(
                         params=params,
                         param_grads=param_grads,
@@ -2045,138 +2202,168 @@ class OptimizerLoop:
                         logs=logs,
                     )
 
-                    l2_regularization.update_grad_norm(
-                        self._clip_grad_norm(train_tenc, logs))
+                grad_norm = self._clip_grad_norm(logs, is_instance_batch)
+                l2_regularization.update_grad_norm(grad_norm)
+                l1_regularization.update_grad_norm(grad_norm)
 
-                    self._optimizer_step(is_instance_batch,
-                                         is_first_step,
-                                         is_second_step)
+                self._optimizer_step(is_instance_batch,
+                                     is_first_step,
+                                     is_second_step)
 
-                    if self.args.use_ema and self.ema_model is not None:
-                        self.ema_model.step(self.unet)
-                    if self._profiler is not None:
-                        self._profiler.step()
-                    self.optimizer.zero_grad(
-                        set_to_none=self.args.gradient_set_to_none)
+                if self.args.use_ema and self.ema_model is not None:
+                    self.ema_model.step(self.unet)
+                if self._profiler is not None:
+                    self._profiler.step()
 
-                allocated, cached = get_vram_used()
-                last_lr = self.lr_scheduler.get_last_lr()[0]
+            allocated, cached = get_vram_used()
 
-                status.job_no += self._total_batch_size
+            status.job_no += self._total_batch_size
 
-                # logs_to_histogram = {
-                #     'pred': pred.detach().cpu(),
-                #     'target': target.detach().cpu(),
-                #     'target_pred_dif': (target.detach().cpu()
-                #                         - pred.detach().cpu())}
-
-                loss_step = loss.detach().item()
-                assert self.args.split_loss
+            # logs_to_histogram = {
+            #     'pred': pred.detach().cpu(),
+            #     'target': target.detach().cpu(),
+            #     'target_pred_dif': (target.detach().cpu()
+            #                         - pred.detach().cpu())}
+            loss_step = loss.detach().item()
+            assert self.args.split_loss
+            logs.update({
+                "epoch": counter.epoch,
+                "lr": float(self.lr_scheduler.get_last_lr()[0]),
+                "loss": float(loss_step),
+                "vram": float(cached),
+            })
+            if hasattr(self, 'instance_lr_scheduler'):
                 logs.update({
-                    "epoch": epoch,
-                    "lr": float(last_lr),
-                    "loss": float(loss_step),
-                    "vram": float(cached),
+                    "instance/lr": float(self.instance_lr_scheduler.get_last_lr()[0]),
                 })
-                status.textinfo2 = (
-                    f"Loss: {'%.2f' % loss_step}, "
-                    "LR: {'{:.2E}'.format(Decimal(last_lr))}, "
-                    f"VRAM: {allocated}/{cached} GB"
-                )
-                progress_bar.update(self._total_batch_size)
-                progress_bar.set_postfix(**logs)
-                self.accelerator.log(logs, step=self.args.revision)
+            if self.args.train_loss_sharpness:
+                logs.update({
+                    "loss_shapness": float(unwrap_model(self.trainable_loss_sharpness)
+                                           .get_sharpness().item()),
+                })
 
-                @self.accelerator.on_main_process
-                def log_histogram(logs_to_histogram):
-                    tracker = self.accelerator.get_tracker('tensorboard')
-                    if hasattr(tracker, 'tracker'):
-                        writer = tracker.tracker
-                        for tag, values in logs_to_histogram.items():
-                            writer.add_histogram(
-                                tag, values, global_step=self.args.revision)
-                # log_histogram(logs_to_histogram)
+            status.textinfo2 = (
+                f"Loss: {'%.2f' % loss_step}, "
+                "LR: {'{:.2E}'.format(Decimal(last_lr))}, "
+                f"VRAM: {allocated}/{cached} GB"
+            )
+            self.accelerator.log(logs, step=self.args.revision)
 
-                status.job_count = max_train_steps
-                status.job_no = counter.global_step
-                status.textinfo = (
-                    f"Steps: {counter.global_step}"
-                    f"/{max_train_steps} (Current),"
-                    f" {self.args.revision}/{max_train_steps}"
-                    f" (Lifetime), Epoch: {epoch}"
-                )
+            @self.accelerator.on_main_process
+            def log_histogram(logs_to_histogram):
+                tracker = self.accelerator.get_tracker('tensorboard')
+                if hasattr(tracker, 'tracker'):
+                    writer = tracker.tracker
+                    for tag, values in logs_to_histogram.items():
+                        writer.add_histogram(
+                            tag,
+                            values,
+                            global_step=self.args.revision)
+            # log_histogram(logs_to_histogram)
 
-                if math.isnan(loss_step):
-                    self.accelerator.print(
-                        "Loss is NaN, your model is dead."
-                        " Cancelling training.")
-                    raise InterruptedError()
+            status.job_count = max_train_steps
+            status.job_no = counter.global_step
+            status.textinfo = (
+                f"Steps: {counter.global_step}"
+                f"/{max_train_steps} (Current),"
+                f" {self.args.revision}/{max_train_steps}"
+                f" (Lifetime), Epoch: {counter.epoch}"
+            )
+            if math.isnan(loss_step):
+                self.accelerator.print(
+                    "Loss is NaN, your model is dead."
+                    " Cancelling training.")
+                raise InterruptedError()
+            if status.interrupted:
+                raise InterruptedError()
+            return loss_step
 
-                if status.interrupted:
-                    raise InterruptedError()
+        save_checker = self.SaveChecker(self.args, self, max_train_epochs)
+        for epoch in counter:
+            if self.accelerator.is_main_process:
+                save_checker.checked_save(
+                    counter.epoch,
+                    is_epoch_check=True)
 
-                return loss_step
+            if self._any_train_tenc:
+                train_tenc = epoch < text_encoder_epochs
+                if epoch == text_encoder_epochs:
+                    cleanup()
+            else:
+                train_tenc = False
+            self._set_model_train(train_tenc)
+
             param_model = self.NoSyncParametersPseudoModel(
                 self._extract_optimizer_parameters(),
                 [self.unet, self.text_encoder])
             is_local_sgd_enabled = self.args.local_sgd_steps > 0
-            local_sgd_context = LocalSGD(
-                accelerator=self.accelerator,
-                model=param_model,
-                local_sgd_steps=self.args.local_sgd_steps,
-                enabled=is_local_sgd_enabled,
-            )
+
             if is_local_sgd_enabled:
                 self.accelerator.print(
                     'Local SGD is enabled:',
                     self.args.local_sgd_steps)
-            try:
-                if 'SAM' in self.args.optimizer:
-                    repeat_count = self._gradient_accumulation_steps
-                    if on_first_call():
-                        self.accelerator.print('SAM rho:', self.args.sam_rho)
-                        self.accelerator.print(
-                            'SAM repeat_count:', repeat_count)
-                        self.accelerator.wait_for_everyone()
-                    # for synchronize sampler
-                    batches = []
-                    timestepss = []
-                    latentss = []
-                    noises = []
 
-                    def accum_step(is_first_step, is_second_step, local_sgd):
-                        nonlocal loss_total
-                        for batch, latents, timesteps, noise in zip(
-                                batches, latentss, timestepss, noises):
-                            with (self.accelerator.accumulate(None),
-                                    slave_sync(self.unet),
-                                    slave_sync(self.text_encoder),
-                                    counter.step_context()):
-                                loss_total += loop_step(
-                                    counter, batch,
-                                    latents=latents,
-                                    timesteps=timesteps,
-                                    noise=noise,
-                                    is_first_step=is_first_step,
-                                    is_second_step=is_second_step)
-                                if is_second_step:
-                                    local_sgd.step()
-                    with local_sgd_context as local_sgd:
+            loss_total = 0
+            try:
+                with (LocalSGD(
+                            accelerator=self.accelerator,
+                            model=param_model,
+                            local_sgd_steps=self.args.local_sgd_steps,
+                            enabled=is_local_sgd_enabled,
+                        ) as local_sgd,
+                        ParamStatSave(
+                            epoch,
+                            os.path.join(self.args.model_dir, 'logging'),
+                            is_enabled=(self.args.save_params_stat
+                                        and self.self.accelerator
+                                                     .is_main_process)
+                        ) as param_stat_save):
+                    if 'SAM' in self.args.optimizer:
+                        repeat_count = self._gradient_accumulation_steps
+                        if on_first_call():
+                            self.accelerator.print(
+                                'SAM rho:', self.args.sam_rho)
+                            self.accelerator.print(
+                                'SAM repeat_count:', repeat_count)
+                            self.accelerator.wait_for_everyone()
+                        # for synchronize sampler
+                        batches = []
+                        timestepss = []
+                        latentss = []
+                        noises = []
+
+                        def accum_step(is_first_step, is_second_step):
+                            nonlocal loss_total
+                            for batch, latents, timesteps, noise in zip(
+                                    batches, latentss, timestepss, noises):
+                                with (self.accelerator.accumulate(None),
+                                        slave_sync(self.unet),
+                                        slave_sync(self.text_encoder),
+                                        counter.step_context()):
+                                    loss_total += loop_step(
+                                        batch,
+                                        latents=latents,
+                                        timesteps=timesteps,
+                                        noise=noise,
+                                        param_stat_save=param_stat_save,
+                                        is_first_step=is_first_step,
+                                        is_second_step=is_second_step)
+                                    if is_second_step:
+                                        local_sgd.step()
                         syncronize_python_rng_state(self.accelerator)
-                        for step, batch in enumerate(self.train_dataloader):
+                        for step, batch in enumerate(
+                                self.train_dataloader):
                             # flush step
-                            if self.accelerator.gradient_state.end_of_dataloader:
+                            if (self.accelerator
+                                    .gradient_state
+                                    .end_of_dataloader
+                                    and self._gradient_accumulation_steps > 1):
                                 with self.accelerator.accumulate(None):
                                     pass
                                 break
                             # collect batches for accumulation
                             # Sample a random timestep for each image
-                            timesteps = torch.randint(
-                                0,
-                                self.noise_scheduler.config.num_train_timesteps,
-                                (self._train_batch_size,),
-                                device=self.accelerator.device,
-                            ).long()
+                            timesteps = self._build_timesteps()
                             latents = self._fetch_latents(batch)
                             # Sample noise that we'll add to the latents
                             noise = self._bulid_noise(latents)
@@ -2187,43 +2374,36 @@ class OptimizerLoop:
                             noises.append(noise)
 
                             if step % repeat_count == repeat_count - 1:
-                                if accum_step(True, False, local_sgd):
+                                if accum_step(True, False):
                                     break
-                                if accum_step(False, True, local_sgd):
+                                if accum_step(False, True):
                                     break
                                 batches = []
                                 timestepss = []
                                 latentss = []
                                 noises = []
-                else:
-                    with local_sgd_context as local_sgd:
+                    else:
                         # for synchronize sampler
                         syncronize_python_rng_state(self.accelerator)
                         for batch in self.train_dataloader:
                             # Sample a random timestep for each image
-                            timesteps = torch.randint(
-                                0,
-                                self.noise_scheduler.config.num_train_timesteps,
-                                (self._train_batch_size,),
-                                device=self.accelerator.device,
-                            ).long()
+                            timesteps = self._build_timesteps()
                             latents = self._fetch_latents(batch)
                             # Sample noise that we'll add to the latents
                             noise = self._bulid_noise(latents)
 
                             with (self.accelerator.accumulate(None),
-                                  slave_sync(self.unet),
-                                  slave_sync(self.text_encoder),
-                                  counter.step_context()):
+                                    slave_sync(self.unet),
+                                    slave_sync(self.text_encoder),
+                                    counter.step_context()):
                                 loss_total += loop_step(
-                                    counter, batch,
+                                    batch,
                                     latents=latents,
                                     timesteps=timesteps,
-                                    noise=noise)
+                                    noise=noise,
+                                    param_stat_save=param_stat_save,
+                                    )
                                 local_sgd.step()
-
-                if param_stat_save is not None:
-                    param_stat_save.epoch_end()
 
                 logs = {"epoch_loss": loss_total / counter.step}
                 self.accelerator.log(logs, step=counter.global_step)
@@ -2231,8 +2411,6 @@ class OptimizerLoop:
                 # self.accelerator.wait_for_everyone()
 
                 self.lr_scheduler.step(is_epoch=True)
-                status.job_count = max_train_steps
-                status.job_no = counter.global_step
 
             except (self.TrainingCompleteException, InterruptedError) as e:
                 print("  Training complete (step check).")
@@ -2242,7 +2420,8 @@ class OptimizerLoop:
                     state = "complete"
 
                 status.textinfo = (
-                    f"Training {state} {counter.global_step}/{max_train_steps},"
+                    f"Training {state} "
+                    f"{counter.global_step}/{max_train_steps},"
                     f" {self.args.revision}"
                     f" total."
                 )
@@ -2478,13 +2657,11 @@ class OptimizerLoop:
 
 # for compatibility
 def build_embd_from_prompt_original(
-        train_tenc,
         args,
         text_encoder,
         tokenizer,
         prompt,
         device):
-    pad_tokens = args.pad_tokens if train_tenc else False
 
     def tokenize(caption):
         # strict_tokens:False -> add_special_tokens=True
@@ -2495,7 +2672,7 @@ def build_embd_from_prompt_original(
     encoder_hidden_states = encode_hidden_state(
         text_encoder,
         tokenize(prompt).unsqueeze(0).to(device),
-        pad_tokens,
+        args.pad_tokens,
         1,
         args.max_token_length,
         tokenizer.model_max_length,

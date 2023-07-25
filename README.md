@@ -1,3 +1,9 @@
+This is the source code we used to train the model for https://huggingface.co/piyohogeo/badanatomy-inhibitor.
+This source code is from https://github.com/d8ahazard/sd_dreambooth_extension
+but it cannot be used as a webui extension.
+
+# Below is the original README.md
+---
 # Dreambooth Extension for Stable-Diffusion-WebUI
 
 This is a WIP port

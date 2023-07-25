@@ -54,7 +54,6 @@ from dreambooth.utils.model_utils import (
 )
 from dreambooth.utils.text_utils import encode_hidden_state
 from dreambooth.utils.utils import cleanup, printm, verify_locon_installed
-from dreambooth.webhook import send_training_update
 from dreambooth.xattention import optim_to
 from helpers.ema_model import EMAModel
 from helpers.log_parser import LogParser
@@ -511,6 +510,7 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
 
         def collate_fn(examples):
             input_ids = [example["input_ids"] for example in examples]
+            uncond_input_ids = [example["uncond_input_ids"] for example in examples]
             pixel_values = [example["image"] for example in examples]
             types = [example["is_class"] for example in examples]
             weights = [
@@ -527,9 +527,11 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                     memory_format=torch.contiguous_format
                 ).float()
             input_ids = torch.cat(input_ids, dim=0)
+            uncond_input_ids = torch.cat(uncond_input_ids, dim=0)
 
             batch_data = {
                 "input_ids": input_ids,
+                "uncond_input_ids": uncond_input_ids,
                 "images": pixel_values,
                 "types": types,
                 "loss_avg": loss_avg,
@@ -1006,13 +1008,6 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                             last_samples.append(log_image)
                         for log_name in log_names:
                             last_prompts.append(log_name)
-                        send_training_update(
-                            last_samples,
-                            args.model_name,
-                            last_prompts,
-                            global_step,
-                            args.revision,
-                        )
 
                         del log_images
                         del log_names
@@ -1159,16 +1154,35 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                         tokenizer.model_max_length,
                         args.clip_skip,
                     )
+                    uncond_encoder_hidden_states = encode_hidden_state(
+                        text_encoder,
+                        batch["uncond_input_ids"],
+                        pad_tokens,
+                        b_size,
+                        args.max_token_length,
+                        tokenizer.model_max_length,
+                        args.clip_skip,
+                    )
 
                     # Predict the noise residual
                     if args.use_ema and args.ema_predict:
-                        noise_pred = ema_model(
+                        noise_pred_text = ema_model(
                             noisy_latents, timesteps, encoder_hidden_states
+                        ).sample
+                        noise_pred_uncond = ema_model(
+                            noisy_latents, timesteps, uncond_encoder_hidden_states
                         ).sample
                     else:
-                        noise_pred = unet(
+                        noise_pred_text = unet(
                             noisy_latents, timesteps, encoder_hidden_states
                         ).sample
+                        noise_pred_uncond = unet(
+                            noisy_latents, timesteps, uncond_encoder_hidden_states
+                        ).sample
+
+
+                    guidance_scale = 7.0
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                     # Get the target for loss depending on the prediction type
                     if noise_scheduler.config.prediction_type == "v_prediction":
@@ -1259,6 +1273,7 @@ def main(class_gen_method: str = "Native Diffusers") -> TrainResult:
                 del noise_pred
                 del latents
                 del encoder_hidden_states
+                del uncond_encoder_hidden_states
                 del noise
                 del timesteps
                 del noisy_latents

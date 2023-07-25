@@ -112,10 +112,10 @@ class DbDataset(torch.utils.data.Dataset):
                 img = open_and_trim(image_path, res, False)
                 image = self.image_transforms(img)
             if self.shuffle_tags:
-                caption, input_ids = self.cache_caption(image_path, caption)
+                caption, parameters = self.cache_caption(image_path, caption)
             else:
-                input_ids = self.caption_cache[image_path]
-        return image, input_ids
+                parameters = self.caption_cache[image_path]
+        return image, parameters
 
     def cache_latent(self, image_path, res):
         if self.vae is not None:
@@ -125,8 +125,9 @@ class DbDataset(torch.utils.data.Dataset):
             latents = self.vae.encode(img_tensor).latent_dist.sample().squeeze(0).to("cpu")
             self.latents_cache[image_path] = latents
 
-    def cache_caption(self, image_path, caption):
+    def cache_caption(self, image_path, caption, negative_caption=''):
         input_ids = None
+        uncond_input_ids = None
         auto_add_special_tokens = False if self.strict_tokens else True
         if self.tokenizer is not None and (image_path not in self.caption_cache or self.debug_dataset):
             if self.shuffle_tags:
@@ -137,13 +138,19 @@ class DbDataset(torch.utils.data.Dataset):
                 input_ids = self.tokenizer(caption, padding=True, truncation=True,
                                            add_special_tokens=auto_add_special_tokens,
                                            return_tensors="pt").input_ids
+                uncond_input_ids = self.tokenizer(negative_caption, padding=True, truncation=True,
+                                                    add_special_tokens=auto_add_special_tokens,
+                                                    return_tensors="pt").input_ids
             else:
                 input_ids = self.tokenizer(caption, padding='max_length', truncation=True,
                                            add_special_tokens=auto_add_special_tokens,
                                            return_tensors='pt').input_ids
+                uncond_input_ids = self.tokenizer(negative_caption, padding='max_length', truncation=True,
+                                                    add_special_tokens=auto_add_special_tokens,
+                                                    return_tensors='pt').input_ids
             if not self.shuffle_tags:
-                self.caption_cache[image_path] = input_ids
-        return caption, input_ids
+                self.caption_cache[image_path] = {'input_ids': input_ids, 'uncond_input_ids': uncond_input_ids}
+        return caption, {'input_ids': input_ids, 'uncond_input_ids': uncond_input_ids}
 
     def make_buckets_with_caching(self, vae):
         self.vae = vae
@@ -324,17 +331,20 @@ class DbDataset(torch.utils.data.Dataset):
     def __getitem__(self, index):
         image_path, caption, is_class_image = self.sample_cache[index]
         if not self.debug_dataset:
-            image_data, input_ids = self.load_image(image_path, caption, self.active_resolution)
+            image_data, parameters = self.load_image(image_path, caption, self.active_resolution)
         else:
+            # TODO: not work
             image_data = image_path
             # print(f"Recoding: {caption}")
             caption, cap_tokens = self.cache_caption(image_path, caption)
             rebuilt = self.tokenizer.decode(cap_tokens.tolist()[0])
             input_ids = (caption, rebuilt)
+            parameters = {'input_ids': input_ids}
         # If we have reached the end of our bucket, increment to the next, update the count, reset image index.
         example = {
             "image": image_data,
-            "input_ids": input_ids,
+            "input_ids": parameters['input_ids'],
+            "uncond_input_ids": parameters['uncond_input_ids'],
             "res": self.active_resolution,
             "is_class": is_class_image
         }

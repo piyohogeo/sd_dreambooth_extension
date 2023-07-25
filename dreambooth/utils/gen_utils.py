@@ -38,7 +38,8 @@ def build_resolution_dataset_and_sampler(
 
 def generate_classifiers(
         args: DreamboothConfig,
-        ui=True):
+        ui=True,
+        flash_cache=False):
     """
 
     @param args: A DreamboothConfig

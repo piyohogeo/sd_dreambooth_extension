@@ -6,6 +6,7 @@ import contextlib
 import io
 import gc
 import itertools
+import json
 import logging
 import math
 import os
@@ -185,6 +186,181 @@ def create_vae(args):
     return new_vae
 
 
+def syncronize_python_rng_state():
+    # syncronize python random state
+    random_seed = random.randint(0, 2 ** 32)
+    random_seed = int(accelerate.utils.broadcast(
+        torch.tensor(random_seed)))
+    random.seed(random_seed)
+
+
+class PramStatSave:
+    def __init__(self, epoch, logging_dir):
+        self._weights_sum = []
+        self._grad2_sum = []
+        self._count = 0
+        self._logging_dir = logging_dir
+        self._epoch = epoch
+
+    @torch.no_grad()
+    def step(self, params, grads):
+        self._count += 1
+        params_cpu = [p.detach().cpu() for p in params]
+        grads_cpu = [g.detach().cpu() for g in grads]
+        grads2 = [g * g for g in grads_cpu]
+        if self._weights_sum == []:
+            self._weights_sum = params_cpu
+            self._grad2_sum = grads2
+        else:
+            self._weights_sum = list(map(lambda x: x[0] + x[1],
+                                         zip(self._weights_sum,
+                                             params_cpu)))
+            self._grad2_sum = list(map(lambda x: x[0] + x[1],
+                                       zip(self._grad2_sum, grads2)))
+
+    @torch.no_grad()
+    def epoch_end(self):
+        weight_means = [weight * (1.0 / self._count)
+                        for weight in self._weights_sum]
+        grad2_means = [grad2 * (1.0 / self._count)
+                       for grad2 in self._grad2_sum]
+        param_path = os.path.join(self._logging_dir, f'stats_{self._epoch}.pt')
+        torch.save({'weight_means': weight_means,
+                    'grad2_means': grad2_means},
+                   param_path)
+
+
+class L2Regularization:
+    @torch.no_grad()
+    def __init__(self, args):
+        self._enabled = args.l2_regularization
+        self._lambda = args.l2_regularization_lambda
+        if self._enabled:
+            print('l2_regularization is enabled:', self._lambda)
+
+    def calc_loss(self, parameters, logs):
+        if not self._enabled:
+            return torch.tensor(0.0)
+
+        param_l2_norm2 = sum(
+            [torch.sum(p.pow(2.0))
+                for p in parameters])
+        loss = self._lambda * param_l2_norm2
+        logs.update({
+                "param_l2_norm2":
+                float(param_l2_norm2.detach().item()),
+            })
+        return loss
+
+
+class EWC:
+    @torch.no_grad()
+    def __init__(self, args, device, ref_optimizer_parameters=None):
+        if args.ewc_params_path:
+            model_dir = os.path.split(
+                os.path.split(args.ewc_params_path)[0])[0]
+            if ref_optimizer_parameters:
+                with open(os.path.join(model_dir,
+                                       'optimizer_parameters.json'),
+                          'r', encoding='utf-8') as f:
+                    optimizer_parameters = json.load(f)
+                for name, ref_name in zip(optimizer_parameters,
+                                          ref_optimizer_parameters):
+                    name = name.replace('module.', '')
+                    ref_name = ref_name.replace('module.', '')
+                    if name != ref_name:
+                        print(name, ref_name)
+
+            stats = torch.load(args.ewc_params_path)
+            self._weight_means = stats['weight_means']
+            self._grad2_means = stats['grad2_means']
+            grad2_mean_sum = sum(
+                [torch.sum(g2m)
+                    for g2m in self._grad2_means])
+            grad2_mean_len = sum(
+                [torch.numel(g2m)
+                    for g2m in self._grad2_means])
+            self._grad2_coef = (args.ewc_lambda
+                                * grad2_mean_sum
+                                * grad2_mean_len)
+            print('ewc_lambda:', args.ewc_lambda)
+            print('ewc._grad2_coef:', self._grad2_coef)
+
+            self._weight_means = [w.to(device) for w in self._weight_means]
+            self._grad2_means = [g.to(device) for g in self._grad2_means]
+            self._grad2_coef = self._grad2_coef.to(device)
+        else:
+            self._weight_means = None
+
+    def calc_loss(self, parameters, logs):
+        if self._weight_means is None:
+            return torch.tensor(0.0)
+
+        loss = sum([torch.sum(self._grad2_coef * g2 * (p - w).pow(2.0))
+                    for p, w, g2
+                    in zip(parameters,
+                           self._weight_means,
+                           self._grad2_means)])
+        logs.update({
+                "ewc_loss":
+                float(loss.detach().item()),
+            })
+        return loss
+
+
+@torch.no_grad()
+def dot_all_tensors(xs, ys):
+    return sum([torch.sum(x * y) for x, y in zip(xs, ys)])
+
+
+@torch.no_grad()
+def norm_all_tensors(xs):
+    return torch.sqrt(dot_all_tensors(xs, xs))
+
+
+@torch.no_grad()
+def offset_scaled_(dst_ts, src_ts, scale):
+    for d, s in zip(dst_ts, src_ts):
+        new_d = d + s * scale
+        d.copy_(new_d)
+
+
+@torch.no_grad()
+def try_copy(src_ts, dst_ts):
+    if dst_ts is None or len(dst_ts) == 0:
+        dst_ts = [t.detach().clone() for t in src_ts]
+    else:
+        for src_t, dst_t in zip(src_ts, dst_ts):
+            dst_t.copy_(src_t)
+    return dst_ts
+
+
+@torch.no_grad()
+def offset_by_grad_(param_grads, prior_grads, logs):
+    with torch.no_grad():
+        grads_dot = dot_all_tensors(param_grads, prior_grads)
+        param_grads_norm = norm_all_tensors(param_grads)
+        prior_grads_norm = norm_all_tensors(prior_grads)
+        grads_cos = grads_dot / (param_grads_norm * prior_grads_norm)
+        offset_coef = -grads_cos * param_grads_norm / prior_grads_norm
+        offset_scaled_(param_grads, prior_grads, offset_coef)
+        offseted_param_grads_norm = norm_all_tensors(param_grads)
+        offseted_grads_dot = dot_all_tensors(param_grads, prior_grads)
+        logs.update({
+                "grads_dot":
+                float(grads_dot.item()),
+                "offseted_grads_dot":
+                float(offseted_grads_dot.item()),
+                "grads_cos": float(grads_cos.item()),
+                "param_grads_norm":
+                float(param_grads_norm.item()),
+                "prior_grads_norm":
+                float(prior_grads_norm.item()),
+                "offseted_param_grads_norm":
+                float(offseted_param_grads_norm.item()),
+            })
+
+
 class OptimizerLoop:
     def __init__(self,
                  args,
@@ -202,6 +378,10 @@ class OptimizerLoop:
         self._is_use_ref = 'reference' in args.noise_pred_target_method
         self._is_use_uncond_null = ('uncond_cancelled_by_null'
                                     in args.noise_pred_target_method)
+        if self._is_use_uncond_null:
+            self._unet_input_count = 3
+        else:
+            self._unet_input_count = 2
 
         self._stop_text_percentage = args.stop_text_encoder
         if not args.train_unet:
@@ -233,6 +413,14 @@ class OptimizerLoop:
 
         sched_train_steps = self._build_lr_schueduler()
         self._prepare_objects()
+
+        self._optimizer_parameter_names = self._lookup_parameter_name(
+            self._extract_optimizer_parameters())
+        if self.accelerator.is_main_process:
+            with open(os.path.join(args.model_dir, 
+                                   'optimizer_parameters.json'),
+                      'w', encoding='utf-8') as f:
+                json.dump(self._optimizer_parameter_names, f, indent=4)
 
         global_step, global_epoch, resume_step, first_epoch =\
             self._try_resume()
@@ -282,6 +470,8 @@ class OptimizerLoop:
                 print("  LoRA Text Encoder LR: "
                       f"{self.args.lora_txt_learning_rate}")
             print(f"  V2: {self.args.v2}")
+
+        self.accelerator.wait_for_everyone()
 
         self._inner_loop(max_train_steps,
                          max_train_epochs,
@@ -638,21 +828,36 @@ class OptimizerLoop:
 
         self.noise_scheduler = get_noise_scheduler(self.args)
 
+    def _lookup_parameter_name(self, parameters):
+        unet_param_map = {p: name 
+                          for name, p
+                          in self.unet.named_parameters()}
+        text_encoder_param_map = {p: name
+                                  for name, p
+                                  in self.text_encoder.named_parameters()}
+
+        def lookup_name_of_parameter(p):
+            if p in unet_param_map:
+                return 'unet.' + unet_param_map[p]
+            elif p in text_encoder_param_map:
+                return 'te.' + text_encoder_param_map[p]
+            else:
+                return None
+        return [lookup_name_of_parameter(p) for p in parameters]
+
     def _build_dataloader(self):
         instance_prompts, class_prompts = generate_classifiers(
             self.args, ui=False
         )
         n_workers = 0
 
-        if self.args.cache_latents:
-            printm("Created tenc")
-            vae = create_vae(self.args)
-            printm("Created vae")
-        else:
-            vae = None
-        if self.args.cache_latents:
-            vae.to(self.accelerator.device, dtype=self._weight_dtype)
-            vae.eval()
+        assert self.args.cache_latents
+        printm("Created tenc")
+        vae = create_vae(self.args)
+        printm("Created vae")
+        vae.to(self.accelerator.device, dtype=self._weight_dtype)
+        vae.eval()
+
         printm("Loading dataset...")
         random.seed(self.accelerator.process_index)
 
@@ -678,7 +883,7 @@ class OptimizerLoop:
             instance_prompts=instance_prompts,
             class_prompts=class_prompts,
             batch_size=self._train_batch_size,
-            vae=vae if self.args.cache_latents else None,
+            vae=vae,
             interleave_size=self.dataset_interleave_size
         )
 
@@ -704,19 +909,16 @@ class OptimizerLoop:
                                 for example in examples]
             guidance_scales = [example['guidance_scale']
                                for example in examples]
-            pixel_values = [example["image"] for example in examples]
+            images = [example["image"].to(self.accelerator.device)
+                      for example in examples]
             types = [example["is_class"] for example in examples]
-            pixel_values = torch.stack(pixel_values)
-            if not self.args.cache_latents:
-                pixel_values = pixel_values.to(
-                    memory_format=torch.contiguous_format
-                ).float()
+            images = torch.stack(images)
 
             batch_data = {
                 "prompt": prompts,
                 "negative_prompt": negative_prompts,
                 "guidance_scale": guidance_scales,
-                "images": pixel_values,
+                "images": images,
                 "types": types,
             }
             return batch_data
@@ -1032,14 +1234,16 @@ class OptimizerLoop:
         assert batched_loss.shape[0] == prod.shape[0]
         return torch.sum(batched_loss)
 
-    def _extract_optimizer_parameters(self):
+    def _extract_optimizer_parameters(self, is_check_grad=False):
         parameters = itertools.chain(
             *(p['params']
                 for p
                 in self.optimizer.param_groups))
+        if is_check_grad:
+            parameters = [p for p in parameters if p.grad is not None]
         return parameters
 
-    def _clip_grad_norm(self, train_tenc):
+    def _clip_grad_norm(self, train_tenc, logs):
         if self.args.use_lora:
             params_to_clip = self._extract_optimizer_parameters()
             cliped_grad_norm = self.accelerator.clip_grad_norm_(
@@ -1054,6 +1258,11 @@ class OptimizerLoop:
                 params_to_clip = self.unet.parameters()
             cliped_grad_norm = self.accelerator.clip_grad_norm_(
                 params_to_clip, self.args.clip_grad_norm_global)
+        logs.update(
+            {
+                "cliped_grad_norm":
+                float(cliped_grad_norm.item()),
+            })
         return cliped_grad_norm
 
     def _calc_guidance_scale(self, global_step, batch):
@@ -1139,9 +1348,13 @@ class OptimizerLoop:
         return encoder_hidden_states_input, uncond_null_encoder_hidden_states
 
     def _calc_unet(self,
-                   noisy_latents_input,
-                   timesteps_input,
+                   noisy_latents,
+                   timesteps,
                    encoder_hidden_states_input):
+        timesteps_input = torch.concat(
+            [timesteps] * self._unet_input_count)
+        noisy_latents_input = torch.cat(
+            [noisy_latents] * self._unet_input_count)
         if self.args.use_ema and self.args.ema_predict:
             noise_pred_output = self.ema_model(
                 noisy_latents_input, timesteps_input,
@@ -1200,9 +1413,6 @@ class OptimizerLoop:
                     dim=1)
         else:
             noise_pred_uncond_reference = None
-            noise_pred_text_reference = None
-            noise_pred_output_reference = None
-            noise_pred_reference = None
             noise_pred_reference_norm = None
             noise_norm = None
         return {
@@ -1227,7 +1437,6 @@ class OptimizerLoop:
                 return tuple(map(torch.stack, xss[:-1]))
             else:
                 return tuple([None] * 3)
-            
         (model_pred_instance,
          _,
          _) = instance_chunks = filter_chunk(False)
@@ -1245,60 +1454,39 @@ class OptimizerLoop:
 
         return instance_chunks, prior_chunks
 
-    def _inner_loop(self,
-                    max_train_steps,
-                    max_train_epochs,
-                    text_encoder_epochs,
-                    global_step,
-                    global_epoch,
-                    resume_step,
-                    first_epoch,
-                    null_guidance_scale=0.0,
-                    fft_method=None,
-                    train_steps=100):
-        if self._stop_text_percentage == 0:
-            self._embeds_cache = {}
-            self.text_encoder.to(self.accelerator.device,
-                                 dtype=self._weight_dtype)
-        # Afterwards we recalculate our number of training epochs
-        # We need to initialize the trackers we use, and also store our
-        # configuration.
-        # The trackers will initialize automatically on the main process.
-        if self.accelerator.is_main_process:
-            self.accelerator.init_trackers("dreambooth")
+    class SaveChecker:
+        def __init__(self, args, parent, max_train_epochs):
+            self.args = args
+            self._parent = parent
+            self._last_model_save = 0
+            self._last_image_save = 0
+            self._max_train_epochs = max_train_epochs
 
-        session_epoch = 0
-        last_model_save = 0
-        last_image_save = 0
-
-        os.environ.__setattr__("CUDA_LAUNCH_BLOCKING", 1)
-
-        def check_save(is_epoch_check=False):
-            nonlocal last_model_save
-            nonlocal last_image_save
+        def checked_save(self, session_epoch, is_epoch_check=False):
             save_model_interval = self.args.save_embedding_every
             save_image_interval = self.args.save_preview_every
-            save_completed = session_epoch >= max_train_epochs
+            save_completed = session_epoch >= self._max_train_epochs
             save_canceled = status.interrupted
             save_image = False
             save_model = False
             if not save_canceled and not save_completed:
                 # Check to see if the number of epochs
                 # since last save is gt the interval
-                if 0 < save_model_interval <= session_epoch - last_model_save:
+                if (0 < save_model_interval
+                        <= session_epoch - self._last_model_save):
                     save_model = True
-                    last_model_save = session_epoch
+                    self._last_model_save = session_epoch
 
                 # Repeat for sample images
-                if 0 < save_image_interval <= session_epoch - last_image_save:
+                if (0 < save_image_interval
+                        <= session_epoch - self._last_image_save):
                     save_image = True
-                    last_image_save = session_epoch
+                    self._last_image_save = session_epoch
 
             else:
                 print("\nSave completed/canceled.")
-                if global_step > 0:
-                    save_image = True
-                    save_model = True
+                save_image = True
+                save_model = True
 
             save_snapshot = False
             save_lora = False
@@ -1315,17 +1503,15 @@ class OptimizerLoop:
 
             if save_model:
                 if save_canceled:
-                    if global_step > 0:
-                        print("Canceled, enabling saves.")
-                        save_lora = self.args.save_lora_cancel
-                        save_snapshot = self.args.save_state_cancel
-                        save_checkpoint = self.args.save_ckpt_cancel
+                    print("Canceled, enabling saves.")
+                    save_lora = self.args.save_lora_cancel
+                    save_snapshot = self.args.save_state_cancel
+                    save_checkpoint = self.args.save_ckpt_cancel
                 elif save_completed:
-                    if global_step > 0:
-                        print("Completed, enabling saves.")
-                        save_lora = self.args.save_lora_after
-                        save_snapshot = self.args.save_state_after
-                        save_checkpoint = self.args.save_ckpt_after
+                    print("Completed, enabling saves.")
+                    save_lora = self.args.save_lora_after
+                    save_snapshot = self.args.save_state_after
+                    save_checkpoint = self.args.save_ckpt_after
                 else:
                     save_lora = self.args.save_lora_during
                     save_snapshot = self.args.save_state_during
@@ -1337,7 +1523,7 @@ class OptimizerLoop:
                     or save_image
                     or save_model
             ):
-                self._save_weights(
+                self._parent.save_weights(
                     save_image,
                     save_model,
                     save_snapshot,
@@ -1345,6 +1531,60 @@ class OptimizerLoop:
                     save_lora,
                 )
             return save_model
+
+    def _bulid_noise(self, latents):
+        if self.args.offset_noise < 0:
+            noise = torch.randn_like(latents,
+                                     device=latents.device)
+        else:
+            noise = torch.randn_like(
+                latents, device=latents.device
+            ) + self.args.offset_noise * torch.randn(
+                latents.shape[0],
+                latents.shape[1],
+                1,
+                1,
+                device=latents.device,
+            )
+        return noise
+
+    def _inner_loop(self,
+                    max_train_steps,
+                    max_train_epochs,
+                    text_encoder_epochs,
+                    global_step,
+                    global_epoch,
+                    resume_step,
+                    first_epoch,
+                    null_guidance_scale=0.0,
+                    fft_method=None,
+                    train_steps=100):
+
+        @contextlib.contextmanager
+        def slave_sync(model):
+            if self.accelerator.sync_gradients:
+                context = contextlib.nullcontext
+            else:
+                context = self.accelerator.no_sync
+
+            with context(model):
+                yield
+
+        if self._stop_text_percentage == 0:
+            self._embeds_cache = {}
+            self.text_encoder.to(self.accelerator.device,
+                                 dtype=self._weight_dtype)
+        # Afterwards we recalculate our number of training epochs
+        # We need to initialize the trackers we use, and also store our
+        # configuration.
+        # The trackers will initialize automatically on the main process.
+        if self.accelerator.is_main_process:
+            self.accelerator.init_trackers("dreambooth")
+
+        session_epoch = 0
+        save_checker = self.SaveChecker(self.args, self, max_train_epochs)
+
+        os.environ.__setattr__("CUDA_LAUNCH_BLOCKING", 1)
 
         # Only show the progress bar once on each machine.
         progress_bar = mytqdm(
@@ -1376,7 +1616,12 @@ class OptimizerLoop:
         if self.accelerator.num_processes == 1:
             self._build_hist()
 
-        prior_grads = []
+        if self.args.split_optimizer:
+            prior_grads = []
+
+        l2_regularization = L2Regularization(self.args)
+        ewc = EWC(self.args, self.accelerator.device)
+
         for epoch in range(first_epoch, max_train_epochs):
             if training_complete:
                 print("Training complete, breaking epoch.")
@@ -1414,11 +1659,12 @@ class OptimizerLoop:
             current_prior_loss_weight = current_prior_loss(
                 self.args, current_epoch=global_epoch
             )
-            random_seed = random.randint(0, 2 ** 32)
-            random_seed = int(accelerate.utils.broadcast(
-                torch.tensor(random_seed)))
-            random.seed(random_seed)
 
+            param_stat_save = PramStatSave(
+                os.path.join(self.args.model_dir, 'logging'),
+                epoch) if self.args.save_params_stat else None
+            # for synchronize sampler
+            syncronize_python_rng_state()
             for step, batch in enumerate(self.train_dataloader):
                 # Skip steps until we reach the resumed step
                 if (
@@ -1432,16 +1678,7 @@ class OptimizerLoop:
                     status.job_no += self._total_batch_size
                     continue
 
-                @contextlib.contextmanager
-                def slave_sync(model):
-                    if self.accelerator.sync_gradients:
-                        context = contextlib.nullcontext
-                    else:
-                        context = self.accelerator.no_sync
-
-                    with context(model):
-                        yield
-
+                logs = {}
                 with (self.accelerator.accumulate(None),
                       slave_sync(self.unet),
                       slave_sync(self.text_encoder)):
@@ -1450,19 +1687,7 @@ class OptimizerLoop:
                     latents = batch["images"].to(self.accelerator.device)
 
                     # Sample noise that we'll add to the latents
-                    if self.args.offset_noise < 0:
-                        noise = torch.randn_like(latents,
-                                                 device=latents.device)
-                    else:
-                        noise = torch.randn_like(
-                            latents, device=latents.device
-                        ) + self.args.offset_noise * torch.randn(
-                            latents.shape[0],
-                            latents.shape[1],
-                            1,
-                            1,
-                            device=latents.device,
-                        )
+                    noise = self._bulid_noise(latents)
                     b_size = latents.shape[0]
 
                     # Sample a random timestep for each image
@@ -1471,22 +1696,13 @@ class OptimizerLoop:
                         self.noise_scheduler.config.num_train_timesteps,
                         (b_size,),
                         device=latents.device,
-                    )
-                    timesteps = timesteps.long()
-                    if self._is_use_uncond_null:
-                        unet_input_count = 3
-                    else:
-                        unet_input_count = 2
-                    timesteps_input = torch.concat([timesteps]
-                                                   * unet_input_count)
+                    ).long()
 
                     # Add noise to the latents according
                     # to the noise magnitude at each timestep
                     # (this is the forward diffusion process)
                     noisy_latents = self.noise_scheduler.add_noise(
                         latents, noise, timesteps)
-                    noisy_latents_input = torch.cat(
-                        [noisy_latents] * unet_input_count)
 
                     (encoder_hidden_states_input,
                      uncond_null_encoder_hidden_states) =\
@@ -1497,8 +1713,8 @@ class OptimizerLoop:
                      noise_pred_uncond_null,
                      noise_pred_output_reference) =\
                         self._calc_unet(
-                            noisy_latents_input,
-                            timesteps_input,
+                            noisy_latents,
+                            timesteps,
                             encoder_hidden_states_input
                         )
 
@@ -1541,11 +1757,6 @@ class OptimizerLoop:
 
                     prev_ts = self.noise_scheduler.previous_timestep(timesteps)
                     noise_prods = self.noise_scheduler.calc_noise_prod(prev_ts)
-                    if 'latent' in self.args.noise_pred_target_method:
-                        if global_step == 0:
-                            print('latent in ',
-                                  self.args.noise_pred_target_method)
-                        noise_prods = 1.0 - noise_prods
 
                     assert self.args.split_loss
                     ((model_pred_instance,
@@ -1572,6 +1783,12 @@ class OptimizerLoop:
                                 instance_loss = torch.minimum(
                                     instance_loss, torch.tensor(
                                         self.args.clip_loss))
+                        logs.update({
+                                "inst_loss":
+                                float(instance_loss.detach().item()),
+                            })
+                    else:
+                        instance_loss = torch.tensor(0.0)
 
                     if model_pred_prior is not None:
                         prior_loss = self._loss_fn(
@@ -1580,137 +1797,75 @@ class OptimizerLoop:
                             prior_noise_prod,
                             False,
                             global_step)
-
-                    instance_loss_weight = self.args.instance_loss_weight
-
-                    if (model_pred_instance is not None
-                            and model_pred_prior is not None):
-                        loss = (instance_loss_weight * instance_loss
-                                + current_prior_loss_weight * prior_loss)
-                    elif model_pred_instance is not None:
-                        loss = instance_loss_weight * instance_loss
+                        logs.update({
+                                "prior_loss":
+                                float(prior_loss.detach().item()),
+                            })
                     else:
-                        loss = prior_loss * current_prior_loss_weight
-                    if 'celu' in self.args.loss_function_method:
-                        loss = torch.nn.functional.celu(loss, alpha=0.5)
+                        prior_loss = torch.tensor(0.0)
 
-                    if self.args.l2_regularization:
-                        if global_step == 0:
-                            print('l2_regularization is enabled:',
-                                  self.args.l2_regularization_lambda)
-                        parameters = self._extract_optimizer_parameters()
-                        param_l2_norm2 = sum(
-                            [torch.sum(p.pow(2.0))
-                             for p in parameters
-                             if p.requires_grad])
-                        loss += (self.args.l2_regularization_lambda
-                                 * param_l2_norm2)
+                    loss = (self.args.instance_loss_weight * instance_loss
+                            + current_prior_loss_weight * prior_loss)
+
+                    loss += l2_regularization.calc_loss(
+                        self._extract_optimizer_parameters(),
+                        logs)
+
+                    loss += ewc.calc_loss(
+                        self._extract_optimizer_parameters(),
+                        logs)
 
                     self.accelerator.backward(loss)
 
                     if self.accelerator.sync_gradients:
-                        cliped_grad_norm = self._clip_grad_norm(train_tenc)
-                    else:
-                        cliped_grad_norm = None
+                        if (self.args.split_optimizer
+                                or self.args.save_params_step
+                                or self.args.save_params_stat):
+                            params = self._extract_optimizer_parameters(True)
+                            param_grads = [p.grad for p in params]
+                            if param_stat_save is not None:
+                                param_stat_save.step(params, param_grads)
 
-                    if (self.accelerator.sync_gradients
-                            and (self.args.split_optimizer
-                                 or self.args.save_params_step)):
-                        def collect_params():
-                            parameters = self._extract_optimizer_parameters()
-                            params = [p
-                                      for p
-                                      in parameters
-                                      if (p.requires_grad
-                                          and p.grad is not None)]
-                            grads = [p.grad for p in params]
-                            if (self.accelerator.is_main_process
-                                    and (self.args.split_optimizer
-                                         or self.args.save_params_step)):
-                                return (params, grads)
-                            else:
-                                return (None, grads)
-                        params, param_grads = collect_params()
-                    else:
-                        params, param_grads = None, None
+                            @torch.no_grad()
+                            @self.accelerator.on_main_process
+                            def save_params(filename):
+                                torch.save(
+                                    (params, param_grads),
+                                    os.path.join(
+                                        self.args.model_dir,
+                                        'logging',
+                                        filename))
 
-                    @torch.no_grad()
-                    def try_copy(src_ts, dst_ts):
-                        if dst_ts is None or len(dst_ts) == 0:
-                            dst_ts = [t.detach().clone() for t in src_ts]
-                        else:
-                            for src_t, dst_t in zip(src_ts, dst_ts):
-                                dst_t.copy_(src_t)
-                        return dst_ts
-
-                    @torch.no_grad()
-                    @self.accelerator.on_main_process
-                    def save_params(filename):
-                        torch.save(
-                            (params, param_grads),
-                            os.path.join(
-                                self.args.model_dir,
-                                'logging',
-                                filename))
-                    # wrapped .step() is called if sync_gradients
-                    grads_dot = None
-                    if self.accelerator.sync_gradients:
                         if self.args.split_optimizer:
-                            @torch.no_grad()
-                            def dot_all_tensors(xs, ys):
-                                return sum([torch.sum(x * y)
-                                            for x, y
-                                            in zip(xs, ys)])
-
-                            @torch.no_grad()
-                            def norm_all_tensors(xs):
-                                return torch.sqrt(dot_all_tensors(xs, xs))
-
-                            @torch.no_grad()
-                            def offset_scaled_(dst_ts, src_ts, scale):
-                                for d, s in zip(dst_ts, src_ts):
-                                    new_d = d + s * scale
-                                    d.copy_(new_d)
-
                             if model_pred_instance is not None:
                                 if (len(param_grads) > 0
                                         and len(prior_grads) > 0):
-                                    save_params(
-                                        'instance_params'
-                                        f'_{epoch}_{step}.pt')
-                                    with torch.no_grad():
-                                        grads_dot = dot_all_tensors(
-                                            param_grads, prior_grads)
-                                        param_grads_norm = norm_all_tensors(
-                                            param_grads)
-                                        prior_grads_norm = norm_all_tensors(
-                                            prior_grads)
-                                        grads_cos = grads_dot / (
-                                            param_grads_norm
-                                            * prior_grads_norm)
-                                        offset_coef = (-grads_cos
-                                                       * param_grads_norm
-                                                       / prior_grads_norm)
-                                        offset_scaled_(param_grads,
-                                                       prior_grads,
-                                                       offset_coef)
-                                        offseted_param_grads_norm =\
-                                            norm_all_tensors(param_grads)
-                                        offseted_grads_dot = dot_all_tensors(
-                                            param_grads, prior_grads)
-
-                                self.instance_optimizer.step()
+                                    if self.args.save_params_step:
+                                        save_params(
+                                            f'instance_params_{epoch}_{step}.pt')
+                                    offset_by_grad_(param_grads,
+                                                    prior_grads,
+                                                    logs)
                             else:
-                                self.optimizer.step()
                                 prior_grads = try_copy(param_grads,
                                                        prior_grads)
-                                save_params(
-                                    f'prior_params_{epoch}_{step}.pt')
+                                if self.args.save_params_step:
+                                    save_params(
+                                        f'prior_params_{epoch}_{step}.pt')
                         else:
-                            self.optimizer.step()
                             if self.args.save_params_step:
                                 save_params(
                                     f'params_{epoch}_{step}.pt')
+
+                        self._clip_grad_norm(train_tenc, logs)
+
+                        if self.args.split_optimizer:
+                            if model_pred_instance is not None:
+                                self.instance_optimizer.step()
+                            else:
+                                self.optimizer.step()
+                        else:
+                            self.optimizer.step()
 
                     self.lr_scheduler.step()
                     if self.accelerator.sync_gradients:
@@ -1748,68 +1903,31 @@ class OptimizerLoop:
                 del encoder_hidden_states_input
                 del noise
                 del timesteps
-                del timesteps_input
                 del noisy_latents
-                del noisy_latents_input
                 del target
 
                 loss_step = loss.detach().item()
                 loss_total += loss_step
                 if self.args.split_loss:
-                    logs = {
+                    logs.update({
                         "epoch": epoch,
                         "lr": float(last_lr),
                         "loss": float(loss_step),
                         "vram": float(cached),
-                        "inst_loss_weight": instance_loss_weight,
-                    }
-                    if model_pred_instance is not None:
-                        logs.update(
-                            {
-                                "inst_loss":
-                                float(instance_loss.detach().item()),
-                            })
+                    })
                     if model_pred_prior is not None:
                         logs.update(
                             {
                                 "prior_loss":
                                 float(prior_loss.detach().item()),
                             })
-                    if self.args.l2_regularization:
-                        logs.update(
-                            {
-                                "param_l2_norm2":
-                                float(param_l2_norm2.detach().item()),
-                            })
-                    if grads_dot is not None:
-                        logs.update(
-                            {
-                                "grads_dot":
-                                float(grads_dot.item()),
-                                "offseted_grads_dot":
-                                float(offseted_grads_dot.item()),
-                                "grads_cos": float(grads_cos.item()),
-                                "param_grads_norm":
-                                float(param_grads_norm.item()),
-                                "prior_grads_norm":
-                                float(prior_grads_norm.item()),
-                                "offseted_param_grads_norm":
-                                float(offseted_param_grads_norm.item()),
-                            })
-                    if cliped_grad_norm is not None:
-                        logs.update(
-                            {
-                                "cliped_grad_norm":
-                                float(cliped_grad_norm.item()),
-                            }
-                        )
                 else:
-                    logs = {
+                    logs.update({
                         "epoch": epoch, 
                         "lr": float(last_lr),
                         "loss": float(loss_step),
                         "vram": float(cached),
-                    }
+                    })
 
                 status.textinfo2 = (
                     f"Loss: {'%.2f' % loss_step}, "
@@ -1858,6 +1976,9 @@ class OptimizerLoop:
                     )
 
                     break
+            
+            if param_stat_save is not None:
+                param_stat_save.epoch_end()
 
             logs = {"epoch_loss": loss_total / len(self.train_dataloader)}
             self.accelerator.log(logs, step=global_step)
@@ -1873,7 +1994,8 @@ class OptimizerLoop:
             status.job_no = global_step
 
             if self.accelerator.is_main_process:
-                check_save(True)
+                save_checker.checked_save(session_epoch,
+                                          is_epoch_check=True)
 
             if self.args.num_train_epochs > 1:
                 training_complete = session_epoch >= max_train_epochs
@@ -1890,24 +2012,7 @@ class OptimizerLoop:
                     f" {self.args.revision}"
                     f" total."
                 )
-
                 break
-
-            # Do this at the very END of the epoch,
-            # only after we're sure we're not done
-            if (self.args.epoch_pause_frequency > 0
-                    and self.args.epoch_pause_time > 0):
-                if not session_epoch % self.args.epoch_pause_frequency:
-                    print(
-                        "Giving the GPU a break for"
-                        f" {self.args.epoch_pause_time} seconds."
-                    )
-                    for i in range(self.args.epoch_pause_time):
-                        if status.interrupted:
-                            training_complete = True
-                            print("Training complete, interrupted.")
-                            break
-                        time.sleep(1)
 
         self.accelerator.end_training()
         self.result.msg = msg
@@ -1915,7 +2020,7 @@ class OptimizerLoop:
         self.result.samples = last_samples
         self._stop_profiler()
 
-    def _save_weights(
+    def save_weights(
             self,
             save_image, save_model, save_snapshot, save_checkpoint, save_lora
     ):

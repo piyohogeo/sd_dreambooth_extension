@@ -56,18 +56,18 @@ class ClassDataset:
                 image_dir, _ = os.path.split(image_paths[0])
                 cache_dir = os.path.join(image_dir, 'parameters_cache')
                 os.makedirs(cache_dir, exist_ok=True)
-                path =  os.path.join(cache_dir, filename)
+                path = os.path.join(cache_dir, filename)
                 return path
 
             if len(instance_images[concept_idx]):
+                pbar.set_description(f"Pre-processing images: {os.path.split(instance_dir)[1]}")
                 instance_cache_path = build_cache_path(instance_images[concept_idx])
                 if os.path.exists(instance_cache_path):
                     with open(instance_cache_path, 'rb') as f:
-                        instance_prompt_datas = pickle.load(f)
-                    pbar.update(len(instance_prompt_datas))
+                        instance_prompt_datass = pickle.load(f)
+                    pbar.update(len(instance_prompt_datass))
                 else:
                     # ===== Instance =====
-                    pbar.set_description(f"Pre-processing images: {os.path.split(instance_dir)[1]}")
                     instance_prompt_buckets = sort_prompts(
                         concept,
                         json_getter,
@@ -76,33 +76,33 @@ class ClassDataset:
                         concept_idx,
                         is_class_image=False,
                         pbar=pbar)
-                    instance_prompt_datas =\
+                    instance_prompt_datass =\
                         sum([instance_prompt_datas
                              for _, instance_prompt_datas
                              in instance_prompt_buckets.items()], [])
                     tmp_file_path = instance_cache_path + tmp_file_postfix
                     with open(tmp_file_path, 'wb') as f:
-                        pickle.dump(instance_prompt_datas, f)
+                        pickle.dump(instance_prompt_datass, f)
                     try:
                         os.rename(tmp_file_path, instance_cache_path)
                     except (FileExistsError, PermissionError):
                         os.remove(tmp_file_path)
                     
-                self.instance_prompts.extend(instance_prompt_datas)
+                self.instance_prompts.extend(instance_prompt_datass)
 
             # ===== Class =====
             class_dir = concept.class_data_dir
             if not class_dir:
                 continue
 
+            pbar.set_description(f"Pre-processing images: {os.path.split(class_dir)[1]}")
             class_cache_path = build_cache_path(class_images[concept_idx])
             if os.path.exists(class_cache_path):
                 with open(class_cache_path, 'rb') as f:
-                    existing_prompt_datas = pickle.load(f)
-                pbar.update(len(existing_prompt_datas))
+                    class_prompt_datass = pickle.load(f)
+                pbar.update(len(class_prompt_datass))
             else:
-                pbar.set_description(f"Pre-processing images: {os.path.split(class_dir)[1]}")
-                existing_prompt_buckets = sort_prompts(
+                class_prompt_buckets = sort_prompts(
                     concept,
                     json_getter,
                     class_images[concept_idx],
@@ -111,23 +111,20 @@ class ClassDataset:
                     is_class_image=True,
                     pbar=pbar)
 
+                class_prompt_datass =\
+                    sum([class_prompt_datas
+                         for _, class_prompt_datas
+                         in class_prompt_buckets.items()], [])
                 # Iterate over each resolution of images, per concept
-                existing_prompt_datas = []
-                for res, instance_prompt_datas in instance_prompt_buckets.items():
-                    if len(instance_prompt_datas) == 0:
-                        continue
-                    existing_prompt_datas = existing_prompt_buckets[res] if res in existing_prompt_buckets.keys() else []
-                    existing_prompt_datas.extend(existing_prompt_datas)
-
                     # Extend class prompts by the proper amount
                 tmp_file_path = class_cache_path + tmp_file_postfix
                 with open(tmp_file_path, 'wb') as f:
-                    pickle.dump(existing_prompt_datas, f)
+                    pickle.dump(class_prompt_datass, f)
                 try:
                     os.rename(tmp_file_path, class_cache_path)
                 except (FileExistsError, PermissionError):
                     os.remove(tmp_file_path)
                 
-            self.class_prompts.extend(existing_prompt_datas)
+            self.class_prompts.extend(class_prompt_datass)
 
         pbar.reset(0)

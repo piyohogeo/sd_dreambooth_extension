@@ -131,8 +131,6 @@ class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
                                      DbDatasetForResolution],
             interleave_size: int = 1
             ) -> Tuple[BatchSampler, Dataset]:
-        print(res_instance_datasets.keys()) 
-        print(res_class_datasets.keys()) 
         assert set(res_instance_datasets.keys())\
             == set(res_class_datasets.keys())
         samplers = [InstanceBalancedBatchSampler(

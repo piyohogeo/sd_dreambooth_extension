@@ -26,7 +26,8 @@ class LoraInjectedLinear(nn.Module):
         self.lora_up = nn.Linear(r, out_features, bias=False)
         self.scale = 1.0
 
-        nn.init.normal_(self.lora_down.weight, std=1 / r)
+        # nn.init.normal_(self.lora_down.weight, std=1 / r)
+        nn.init.normal_(self.lora_down.weight, std=0.1 / r)
         nn.init.zeros_(self.lora_up.weight)
 
     def forward(self, input):

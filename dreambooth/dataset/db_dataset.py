@@ -24,8 +24,9 @@ class VAEEncoder:
         self._quant_conv = vae.quant_conv
         self._scaling_factor = vae.config.scaling_factor
 
+    @torch.no_grad()
     def encode(self, img):
-        h = self._encoder(img.to(self._device).to(self._dtype))
+        h = self._encoder(img.to(self._device, self._dtype))
         moments = self._quant_conv(h)
         latent = DiagonalGaussianDistribution(moments).sample()
         return latent * self._scaling_factor
@@ -43,8 +44,6 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
     ) -> None:
         super().__init__()
         print("Init dataset!")
-        # A dictionary of string/latent pairs matching image paths
-        self._latents_cache = {}
         # All of the available bucket resolutions
         # Currently active resolution
         self._hflip = hflip
@@ -59,24 +58,28 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
             ]
         )
 
-        self._vae_encoder = VAEEncoder(vae)
+        if vae is not None:
+            vae_encoder = VAEEncoder(vae)
+        else:
+            vae_encoder = None
 
         if vae is not None:
             self._calc_vae_hash(vae)
-            self._cache_latents(vae)
+            self._cache_latents(vae_encoder)
 
     @torch.no_grad()
     def _load_image(self, image_path):
         flip_index = random.randint(0, 1) if self._hflip else 0
-        if image_path in self._latents_cache:
-            latent = self._latents_cache[image_path][flip_index]
-            return latent
+
+        latents = self._load_latent_cache(image_path)
+        if latents is not None:
+            return latents[flip_index]
         else:
             image = Image.open(image_path)
             img_tensor = self._image_transforms(image)
             if flip_index == 1:
                 img_tensor = transforms.functional.hflip(img_tensor)
-            return self._vae_encoder.encode(img_tensor.unsqueeze(0)).squeeze(0)
+            return img_tensor
 
     def _calc_vae_hash(self, vae):
         if hash(vae) in DbDatasetForResolution._VAE_HASH_CACHE:
@@ -88,8 +91,7 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
         print('vae hash:', self._vae_hash.hexdigest())
         DbDatasetForResolution._VAE_HASH_CACHE[hash(vae)] = self._vae_hash
 
-    @torch.no_grad()
-    def _cache_latent(self, image_path, vae):
+    def _build_latent_path(self, image_path):
         image_path_dir, image_path_filename = os.path.split(image_path)
         latent_dir = os.path.join(image_path_dir,
                                   'latents',
@@ -97,26 +99,39 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
         latent_path = os.path.join(
             latent_dir,
             os.path.splitext(image_path_filename)[0] + '.pt')
+        return latent_path
+
+    def _load_latent_cache(self, image_path):
+        latent_path = self._build_latent_path(image_path)
+        if not os.path.exists(latent_path):
+            return None
+
+        latents = torch.load(latent_path)
+        if len(latents.shape) == 4 and latents.shape[0] == 2:
+            return latents
+        else:
+            return None
+
+    @torch.no_grad()
+    def _cache_latent(self, image_path, vae_encoder):
+        latent_path = self._build_latent_path(image_path)
 
         if os.path.exists(latent_path):
-            latents = torch.load(latent_path)
-            if len(latents.shape) == 4 and latents.shape[0] == 2:
-                self._latents_cache[image_path] = torch.unbind(latents)
-                return True
+            return True
 
-        os.makedirs(latent_dir, exist_ok=True)
+        os.makedirs(os.path.split(latent_path)[0], exist_ok=True)
 
         image = Image.open(image_path)
         if image.size != self._resolution:
             return False
+        assert image.size == self._resolution, (
+                f'{image_path}: {image.size}, {self._resolution}')
 
         img_tensor = self._image_transforms(image)
         fliped_img_tensor = transforms.functional.hflip(img_tensor)
 
         img_tensors = torch.stack([img_tensor, fliped_img_tensor])
-        img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
-        latents = self._vae_encoder.encode(img_tensors).cpu()
-        self._latents_cache[image_path] = torch.unbind(latents)
+        latents = vae_encoder.encode(img_tensors).cpu()
 
         tmp_latent_path = latent_path\
             + '.%08x.tmp' % threading.get_ident()
@@ -127,35 +142,20 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
             os.remove(tmp_latent_path)
         return True
 
-    def _cache_latents(self, vae):
+    def _cache_latents(self, vae_encoder):
         pbar = mytqdm(
             range(len(self._prompts)),
             desc=f"Caching latents for resolution: {self._resolution}",
             position=0)
-        image_paths = [prompt.src_image for prompt in self._prompts]
-        image_paths.sort()
+        image_paths = [prompt.src_image
+                       for prompt
+                       in self._prompts
+                       if prompt.original_resolution == self._resolution]
 
-        cache_filename = hashlib.sha256(
-            pickle.dumps(image_paths)).hexdigest() + '.pickle'
-        image_dir, _ = os.path.split(image_paths[0])
-        cache_dir = os.path.join(image_dir, 'latent_cache')
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_path = os.path.join(cache_dir, cache_filename)
-        if os.path.exists(cache_path):
-            self._latents_cache = torch.load(cache_path)
-            pbar.update(len(self._prompts))
-        else:
-            random.shuffle(image_paths)
-            for image_path in image_paths:
-                self._cache_latent(image_path, vae)
-                pbar.update()
-            tmp_cache_path = (cache_path
-                              + '.%08x.tmp' % threading.get_ident())
-            torch.save(self._latents_cache, tmp_cache_path)
-            try:
-                os.rename(tmp_cache_path, cache_path)
-            except (FileExistsError, PermissionError):
-                os.remove(tmp_cache_path)
+        random.shuffle(image_paths)
+        for image_path in image_paths:
+            self._cache_latent(image_path, vae_encoder)
+            pbar.update()
 
     def get_weights(self):
         return [prompt_data.weight for prompt_data in self._prompts]

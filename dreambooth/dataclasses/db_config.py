@@ -21,19 +21,21 @@ def sanitize_name(name):
     return "".join(x for x in name if (x.isalnum() or x in "._- "))
 
 
+_ADAM_BASE_BATCH_SIZE = 4
+
+
 class DreamboothConfig(BaseModel):
     # These properties MUST be sorted alphabetically
     adamw_weight_decay: float = 0.01
+    adam_beta1: float = 0.9 ** (1.0 / _ADAM_BASE_BATCH_SIZE)
+    adam_beta2: float = 0.999 ** (1.0 / _ADAM_BASE_BATCH_SIZE)
     adaptation_beta1: int = 0
     adaptation_beta2: int = 0
     adaptation_d0: float = 1e-8
     adaptation_eps: float = 1e-8
     attention: str = "xformers"
     cache_latents: bool = True
-    clip_grad_norm_global: float = 1.0
-    clip_grad_norm: float = 1.0
-    clip_grad_value: float = 1.0
-    clip_loss: float = 0.0
+    clip_grad_norm: float = 0.0
     clip_skip: int = 1
     concepts_list: List[Dict] = []
     concepts_path: str = ""
@@ -71,6 +73,7 @@ class DreamboothConfig(BaseModel):
     learning_rate: float = 5e-6
     learning_rate_min: float = 1e-6
     lifetime_revision: int = 0
+    local_sgd_steps: int = 0
     lora_learning_rate: float = 1e-4
     lora_model_name: str = ""
     lora_unet_rank: int = 4
@@ -130,6 +133,8 @@ class DreamboothConfig(BaseModel):
     snapshot: str = ""
     split_loss: bool = True
     split_optimizer: bool = False
+    split_optimizer_without_offset: bool = False
+    split_optimizer_ema: bool = False
     src: str = ""
     stop_text_encoder: float = 1.0
     strict_tokens: bool = False
@@ -313,7 +318,7 @@ class DreamboothConfig(BaseModel):
             self.model_dir = model_dir
             self.pretrained_model_name_or_path = working_dir
 
-    def refresh(self):
+    def refresh(self, replace_paths=None):
         """
         Reload self from file
 
@@ -326,6 +331,22 @@ class DreamboothConfig(BaseModel):
             with open(config_file, 'r') as openfile:
                 config_dict = json.load(openfile)
 
+            def replace_str(ds):
+                if isinstance(ds, str) and replace_paths is not None:
+                    for replace_path_from, replace_path_to in replace_paths:
+                        ds = ds.replace(replace_path_from,
+                                        replace_path_to)
+                    return ds
+                elif isinstance(ds, dict):
+                    return {k: replace_str(d)
+                            for k, d
+                            in ds.items()}
+                elif isinstance(ds, list):
+                    return [replace_str(d) for d in ds]
+                else:
+                    return ds
+
+            config_dict = replace_str(config_dict)
             self.load_params(config_dict)
             shared.db_model_config = self
         except Exception as e:

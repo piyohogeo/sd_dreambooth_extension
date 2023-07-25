@@ -27,6 +27,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import accelerate.utils
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.local_sgd import LocalSGD
 from accelerate.utils.random import set_seed as set_seed2
 from diffusers import (
     AutoencoderKL,
@@ -46,6 +47,7 @@ from dreambooth import shared
 from dreambooth.dataclasses.prompt_data import PromptData
 from dreambooth.dataclasses.train_result import TrainResult
 from dreambooth.dataset.sample_dataset import SampleDataset
+from dreambooth.dataset.db_dataset import VAEEncoder
 from dreambooth.deis_velocity import get_velocity
 from dreambooth.diff_to_sd import compile_checkpoint, copy_diffusion_model
 from dreambooth.memory import find_executable_batch_size
@@ -188,15 +190,40 @@ def create_vae(args):
     return new_vae
 
 
-def syncronize_python_rng_state():
+def syncronize_python_rng_state(accelerator):
     # syncronize python random state
     random_seed = random.randint(0, 2 ** 32)
     random_seed = int(accelerate.utils.broadcast(
-        torch.tensor(random_seed)))
+        torch.tensor(random_seed).to(accelerator.device)))
     random.seed(random_seed)
 
 
-class PramStatSave:
+def extract_optimizer_parameters(optimizer, is_check_grad=False):
+    parameters = itertools.chain(
+        *(p['params']
+            for p
+            in optimizer.param_groups))
+    if is_check_grad:
+        parameters = [p for p in parameters if p.grad is not None]
+    return parameters
+
+
+def calc_kl_divergence(ps, qs):
+    assert len(ps.shape) == 1
+    assert len(qs.shape) == 1
+    assert torch.isclose(torch.sum(ps),
+                         torch.tensor(1.0, device=ps.device))
+    assert torch.isclose(torch.sum(qs),
+                         torch.tensor(1.0, device=qs.device))
+    qs = qs + 1e-6
+    qs = qs / torch.sum(qs)
+    xs = ps * torch.log(ps / qs)
+    xs[torch.where(ps < 1e-5)] = 0.0
+    kl = torch.sum(xs)
+    return kl
+
+
+class ParamStatSave:
     def __init__(self, epoch, logging_dir):
         self._weights_sum = []
         self._grad2_sum = []
@@ -239,8 +266,8 @@ class L2Regularization:
         self._ema_beta = args.l2_regularization_ema_beta
         self._adaptive = args.l2_regularization_adaptive
         self._lambda = args.l2_regularization_lambda
-        self._target_grad_norm = args.clip_grad_norm
-        self._ema_grad_norm = torch.tensor(self._target_grad_norm)
+        self._target_grad_norm = torch.tensor(args.clip_grad_norm)
+        self._ema_grad_norm = None
         if self._enabled:
             print('l2_regularization is enabled:',
                   self._lambda, self._adaptive)
@@ -253,20 +280,30 @@ class L2Regularization:
             [torch.sum(p.pow(2.0))
                 for p in parameters])
         loss = self._lambda * param_l2_norm2
-        if self._adaptive:
-            loss *= self._ema_grad_norm / self._target_grad_norm
+        if self._adaptive and self._ema_grad_norm is not None:
+            loss *= torch.maximum(torch.tensor(1.0),
+                                  (self._ema_grad_norm
+                                   / self._target_grad_norm).pow(2.0))
         logs.update({
                 "l2_regularization/param_l2_norm2":
                 float(param_l2_norm2.detach().item()),
-                "l2_regularization/ema_grad_norm":
-                float(self._ema_grad_norm.item()),
             })
+        if self._ema_grad_norm is not None:
+            logs.update({
+                    "l2_regularization/ema_grad_norm":
+                    float(self._ema_grad_norm.item()),
+                })
         return loss
 
     def update_grad_norm(self, grad_norm):
-        self._ema_grad_norm = (self._ema_beta * grad_norm
-                               + (1.0 - self._ema_beta)
-                               * self._ema_grad_norm)
+        if grad_norm is None:
+            self._ema_grad_norm = None
+        elif self._ema_grad_norm is None:
+            self._ema_grad_norm = grad_norm
+        else:
+            self._ema_grad_norm = (self._ema_beta * grad_norm
+                                   + (1.0 - self._ema_beta)
+                                   * self._ema_grad_norm)
 
 
 class EWC:
@@ -326,9 +363,10 @@ class EWC:
 
 def get_vram_used():
     allocated = round(torch.cuda.memory_allocated(0)
-                        / 1024 ** 3, 1)
+                      / 1024 ** 3, 1)
     cached = round(torch.cuda.memory_reserved(0) / 1024 ** 3, 1)
     return allocated, cached
+
 
 @torch.no_grad()
 def dot_all_tensors(xs, ys):
@@ -357,7 +395,7 @@ def try_copy(src_ts, dst_ts):
 
 
 @torch.no_grad()
-def offset_by_grad_(param_grads, prior_grads, logs):
+def offset_by_grad_(param_grads, prior_grads, logs, is_dry_run=False):
     with torch.no_grad():
         grads_dot = dot_all_tensors(param_grads, prior_grads)
         param_grads_norm = norm_all_tensors(param_grads)
@@ -365,23 +403,27 @@ def offset_by_grad_(param_grads, prior_grads, logs):
         grads_cos = torch.minimum(grads_dot
                                   / (param_grads_norm * prior_grads_norm),
                                   torch.tensor(0.0))
-        offset_coef = -grads_cos * param_grads_norm / prior_grads_norm
-        offset_scaled_(param_grads, prior_grads, offset_coef)
-        offseted_param_grads_norm = norm_all_tensors(param_grads)
-        offseted_grads_dot = dot_all_tensors(param_grads, prior_grads)
+        if not is_dry_run:
+            offset_coef = -grads_cos * param_grads_norm / prior_grads_norm
+            offset_scaled_(param_grads, prior_grads, offset_coef)
+            offseted_param_grads_norm = norm_all_tensors(param_grads)
+            offseted_grads_dot = dot_all_tensors(param_grads, prior_grads)
         logs.update({
                 "grads_dot":
                 float(grads_dot.item()),
-                "offseted_grads_dot":
-                float(offseted_grads_dot.item()),
                 "grads_cos": float(grads_cos.item()),
                 "inst/grads_norm":
                 float(param_grads_norm.item()),
                 "prior/grads_norm":
                 float(prior_grads_norm.item()),
-                "inst/offseted_grads_norm":
-                float(offseted_param_grads_norm.item()),
             })
+        if not is_dry_run:
+            logs.update({
+                    "offseted_grads_dot":
+                    float(offseted_grads_dot.item()),
+                    "inst/offseted_grads_norm":
+                    float(offseted_param_grads_norm.item()),
+                })
 
 
 def sequential_do(accelerator: Accelerator):
@@ -409,6 +451,11 @@ class OptimizerLoop:
         self.result = result
         self._train_batch_size = train_batch_size
         self._gradient_accumulation_steps = gradient_accumulation_steps
+        sync_steps = max(gradient_accumulation_steps,
+                         args.local_sgd_steps)
+        assert sync_steps % gradient_accumulation_steps == 0
+        assert (args.local_sgd_steps == 0
+                or sync_steps % args.local_sgd_steps == 0)
         self._profiler = profiler
 
         self._is_use_ref = 'reference' in args.noise_pred_target_method
@@ -422,16 +469,19 @@ class OptimizerLoop:
         self._stop_text_percentage = args.stop_text_encoder
         if not args.train_unet:
             self._stop_text_percentage = 1
+        self._any_train_tenc = 0 != self._stop_text_percentage
+        # verify_locon_installed(args)
+
+        precision = args.mixed_precision if not shared.force_cpu else "no"
+        self._build_accelerator(precision, logging_dir)
+        print = self.accelerator.print
+
         args.max_token_length = int(args.max_token_length)
         if not args.pad_tokens and args.max_token_length > 75:
             print("Cannot raise token length limit ",
                   "above 75 when pad_tokens=False")
 
-        verify_locon_installed(args)
-
-        precision = args.mixed_precision if not shared.force_cpu else "no"
-        self._build_accelerator(precision, logging_dir)
-
+        self.accelerator.wait_for_everyone()
         self._check_interrupt()
         self._build_models()
 
@@ -468,38 +518,34 @@ class OptimizerLoop:
         text_encoder_epochs = round(max_train_epochs
                                     * self._stop_text_percentage)
 
-        if self.accelerator.is_main_process:
-            print("  ***** Running training *****")
-            if shared.force_cpu:
-                print("  TRAINING WITH CPU ONLY")
-            print("  Num batches each epoch = "
-                  f"{len(self.train_dataloader)}")
-            print(f"  Num Epochs = {max_train_epochs}")
-            print("  Batch Size Per Device = "
-                  f"{self._train_batch_size}")
-            print("  Gradient Accumulation steps = "
-                  f"{self._gradient_accumulation_steps}")
-            print("  Total train batch size "
-                  "(w. parallel, distributed) = "
-                  f"{self._total_batch_size}")
-            print(f"  Text Encoder Epochs: {text_encoder_epochs}")
-            print(f"  Total optimization steps = {sched_train_steps}")
-            print(f"  Total training steps = {max_train_steps}")
-            print(f"  Lora: {self.args.use_lora}, Optimizer: "
-                  f"{self.args.optimizer}, Prec: {precision}")
-            print("  Gradient Checkpointing: "
-                  f"{self.args.gradient_checkpointing}")
-            print(f"  EMA: {self.args.use_ema}")
-            print(f"  UNET: {self.args.train_unet}")
-            print("  Freeze CLIP Normalization Layers: "
-                  f"{self.args.freeze_clip_normalization}")
-            print(f"  LR: {self.args.learning_rate}")
-            if self.args.use_lora_extended:
-                print(f"  LoRA Extended: {self.args.use_lora_extended}")
-            if self.args.use_lora and self._stop_text_percentage > 0:
-                print("  LoRA Text Encoder LR: "
-                      f"{self.args.lora_txt_learning_rate}")
-            print(f"  V2: {self.args.v2}")
+        print("  ***** Running training *****")
+        if shared.force_cpu:
+            print("  TRAINING WITH CPU ONLY")
+        print(f"  Num batches each epoch = {len(self.train_dataloader)}")
+        print(f"  Num Epochs = {max_train_epochs}")
+        print(f"  Batch Size Per Device = {self._train_batch_size}")
+        print("  Gradient Accumulation steps = "
+              f"{self._gradient_accumulation_steps}")
+        print("  Total train batch size (w. parallel, distributed) = "
+              f"{self._total_batch_size}")
+        print(f"  Text Encoder Epochs: {text_encoder_epochs}")
+        print(f"  Total optimization steps = {sched_train_steps}")
+        print(f"  Total training steps = {max_train_steps}")
+        print(f"  Lora: {self.args.use_lora}, Optimizer: "
+              f"{self.args.optimizer}, Prec: {precision}")
+        print("  Gradient Checkpointing: "
+              f"{self.args.gradient_checkpointing}")
+        print(f"  EMA: {self.args.use_ema}")
+        print(f"  UNET: {self.args.train_unet}")
+        print("  Freeze CLIP Normalization Layers: "
+              f"{self.args.freeze_clip_normalization}")
+        print(f"  LR: {self.args.learning_rate}")
+        if self.args.use_lora_extended:
+            print(f"  LoRA Extended: {self.args.use_lora_extended}")
+        if self.args.use_lora and self._any_train_tenc:
+            print("  LoRA Text Encoder LR: "
+                  f"{self.args.lora_txt_learning_rate}")
+        print(f"  V2: {self.args.v2}")
 
         self.accelerator.wait_for_everyone()
 
@@ -597,6 +643,7 @@ class OptimizerLoop:
             revision=self.args.revision,
             torch_dtype=torch.float32,
         )
+        self.text_encoder = torch2ify(self.text_encoder)
 
         self.unet = UNet2DConditionModel.from_pretrained(
             self.args.pretrained_model_name_or_path,
@@ -694,7 +741,7 @@ class OptimizerLoop:
         if self.args.gradient_checkpointing:
             if self.args.train_unet:
                 self.unet.enable_gradient_checkpointing()
-            if self._stop_text_percentage != 0:
+            if self._any_train_tenc:
                 self.text_encoder.gradient_checkpointing_enable()
                 if self.args.use_lora:
                     self.text_encoder.text_model.embeddings.requires_grad_(True)
@@ -775,7 +822,7 @@ class OptimizerLoop:
             unet_lora_params = flatten_parameters(unet_lora_params)
 
             self.text_encoder.requires_grad_(False)
-            if self._stop_text_percentage != 0:
+            if self._any_train_tenc:
                 inject_trainable_txt_lora = get_target_module(
                     "injection", False)
                 text_encoder_lora_params, _ = inject_trainable_txt_lora(
@@ -800,45 +847,59 @@ class OptimizerLoop:
             cleanup()
             printm("Cleaned")
 
-            if self.accelerator.is_main_process:
-                print('lr is scaled by num_processes '
-                      '* gradient_accumulation_steps')
-                print('lora_leerning_rate: ',
-                      self.args.lora_learning_rate)
-                print('lora_txt_learning_rate: ',
-                      self.args.lora_txt_learning_rate)
-            self._lora_learning_rate = (
-                self.args.lora_learning_rate
-                * self.accelerator.num_processes
-                * self._gradient_accumulation_steps)
-            self._lora_txt_learning_rate = (
-                self.args.lora_txt_learning_rate
-                * self.accelerator.num_processes
-                * self._gradient_accumulation_steps)
-            if self.accelerator.is_main_process:
-                print('-> lora_leerning_rate: ',
-                      self._lora_learning_rate)
-                print('-> lora_txt_learning_rate: ',
-                      self._lora_txt_learning_rate)
+            print = self.accelerator.print
+            scaling_factor = (self.accelerator.num_processes
+                              * self._gradient_accumulation_steps)
 
-            self.args.learning_rate = self._lora_learning_rate
+            print('lr is scaled by num_processes '
+                  '* gradient_accumulation_steps')
+            print('lora_leerning_rate: ',
+                  self.args.lora_learning_rate)
+            print('lora_txt_learning_rate: ',
+                  self.args.lora_txt_learning_rate)
+            lora_learning_rate = (
+                self.args.lora_learning_rate * scaling_factor)
+            lora_txt_learning_rate = (
+                self.args.lora_txt_learning_rate * scaling_factor)
+            print('-> lora_leerning_rate: ',
+                  lora_learning_rate)
+            print('-> lora_txt_learning_rate: ',
+                  lora_txt_learning_rate)
+
+            learning_rate = lora_learning_rate
+
+            print('Adam betas are scaled by num_processes '
+                  '* gradient_accumulation_steps')
+            print('adam_beta1: ', self.args.adam_beta1)
+            print('adam_beta2: ', self.args.adam_beta2)
+            scaling_factor *= self._train_batch_size
+            adam_betas = (
+                self.args.adam_beta1 ** scaling_factor,
+                self.args.adam_beta2 ** scaling_factor)
+            print('-> adam_beta1: ', adam_betas[0])
+            print('-> adam_beta2: ', adam_betas[1])
+        else:
+            learning_rate = self.args.learning_rate
+            adam_betas = (self.args.adam_beta1, self.args.adam_beta2)
 
         def build_params_to_optimize(lr_scale=1.0):
             if self.args.use_lora:
-                if self._stop_text_percentage != 0:
+                if self._any_train_tenc:
                     return [
                         {
                             "params": unet_lora_params,
-                            "lr": self._lora_learning_rate * lr_scale,
+                            "lr": lora_learning_rate * lr_scale,
+                            "betas": adam_betas,
                         },
                         {
                             "params": text_encoder_lora_params,
-                            "lr": self._lora_txt_learning_rate * lr_scale,
+                            "lr": lora_txt_learning_rate * lr_scale,
+                            "betas": adam_betas,
                         },
                     ]
                 else:
                     params_to_optimize = unet_lora_params
-            elif self._stop_text_percentage != 0:
+            elif self._any_train_tenc:
                 if self.args.train_unet:
                     params_to_optimize = itertools.chain(
                         self.unet.parameters(), self.text_encoder.parameters())
@@ -850,7 +911,8 @@ class OptimizerLoop:
             return [
                 {
                     "params": params_to_optimize,
-                    "lr": self.args.learning_rate * lr_scale,
+                    "lr": learning_rate * lr_scale,
+                    "betas": adam_betas,
                 }
             ]
 
@@ -885,7 +947,7 @@ class OptimizerLoop:
         instance_prompts, class_prompts = generate_classifiers(
             self.args, ui=False
         )
-        n_workers = 0
+        n_workers = 0 if os.name == 'nt' else 1
 
         assert self.args.cache_latents
         printm("Created tenc")
@@ -923,11 +985,11 @@ class OptimizerLoop:
             interleave_size=self.dataset_interleave_size
         )
 
+        vae = torch2ify(vae)
+        self._vae_encoder = VAEEncoder(vae)
         printm("Dataset loaded.")
 
-        if self.args.cache_latents:
-            printm("Unloading vae.")
-            del vae
+        del vae
         cleanup()
 
         def drop_quality_tag(prompt):
@@ -945,10 +1007,8 @@ class OptimizerLoop:
                                 for example in examples]
             guidance_scales = [example['guidance_scale']
                                for example in examples]
-            images = [example["image"].to(self.accelerator.device)
-                      for example in examples]
+            images = [example["image"] for example in examples]
             types = [example["is_class"] for example in examples]
-            images = torch.stack(images)
 
             batch_data = {
                 "prompt": prompts,
@@ -1017,11 +1077,10 @@ class OptimizerLoop:
         # create ema, fix OOM
         to_prepare_objects = [self.unet,
                               self.optimizer,
-                              self.lr_scheduler,
-                              self.train_dataloader]
+                              self.lr_scheduler]
         if self.args.use_ema:
             to_prepare_objects.append(self.ema_model.model)
-        if self._stop_text_percentage != 0:
+        if self._any_train_tenc:
             to_prepare_objects.append(self.text_encoder)
         if self._is_use_ref:
             to_prepare_objects.append(self.unet_reference)
@@ -1035,7 +1094,7 @@ class OptimizerLoop:
         (self.unet,
          self.optimizer,
          self.lr_scheduler,
-         self.train_dataloader, *rs) = prepared_objects
+         *rs) = prepared_objects
 
         def sam_optimizer(optimizer):
             if 'SAM' in self.args.optimizer:
@@ -1054,7 +1113,7 @@ class OptimizerLoop:
         self.optimizer = sam_optimizer(self.optimizer)
         if self.args.use_ema:
             self.ema_model.model, *rs = rs
-        if self._stop_text_percentage != 0:
+        if self._any_train_tenc:
             self.text_encoder, *rs = rs
         if self._is_use_ref:
             self.unet_reference, *rs = rs
@@ -1062,6 +1121,9 @@ class OptimizerLoop:
             self.instance_optimizer, self.instance_lr_scheduler, *rs = rs
             self.instance_optimizer = sam_optimizer(self.instance_optimizer)
         assert rs == []
+
+        self.train_dataloader = self.accelerator.prepare_data_loader(
+            self.train_dataloader, device_placement=False)
 
     def _build_hist(self):
         BIN_DIVS = 16
@@ -1209,20 +1271,6 @@ class OptimizerLoop:
         prod = (prod if is_use_noise_prod_loss
                 else torch.ones_like(prod))
 
-        def calc_kl_divergence(ps, qs):
-            assert len(ps.shape) == 1
-            assert len(qs.shape) == 1
-            assert torch.isclose(torch.sum(ps),
-                                 torch.tensor(1.0, device=ps.device))
-            assert torch.isclose(torch.sum(qs),
-                                 torch.tensor(1.0, device=qs.device))
-            qs = qs + 1e-6
-            qs = qs / torch.sum(qs)
-            xs = ps * torch.log(ps / qs)
-            xs[torch.where(ps < 1e-5)] = 0.0
-            kl = torch.sum(xs)
-            return kl
-
         def loss_fun_batch(x, y, p):
             if ('instance_sqrt_mse' in self.args.loss_function_method
                     and is_instance):
@@ -1304,15 +1352,28 @@ class OptimizerLoop:
         return torch.sum(batched_loss)
 
     def _extract_optimizer_parameters(self, is_check_grad=False):
-        parameters = itertools.chain(
-            *(p['params']
-                for p
-                in self.optimizer.param_groups))
-        if is_check_grad:
-            parameters = [p for p in parameters if p.grad is not None]
-        return parameters
+        extract_optimizer_parameters(self.optimizer, is_check_grad)
+
+    class NoSyncParametersPseudoModel:
+        def __init__(self, parameters, no_sync_models):
+            self._parameters = list(parameters)
+            self._no_sync_models = no_sync_models
+
+        def parameters(self):
+            return self._parameters
+
+        @contextlib.contextmanager
+        def no_sync(self):
+            with contextlib.ExitStack() as stack:
+                for model in self._no_sync_models:
+                    if hasattr(model, "no_sync"):
+                        stack.enter_context(model.no_sync())
+                yield
 
     def _clip_grad_norm(self, train_tenc, logs):
+        if self.args.clip_grad_norm == 0.0:
+            return None
+
         if self.args.use_lora:
             params_to_clip = self._extract_optimizer_parameters()
             cliped_grad_norm = self.accelerator.clip_grad_norm_(
@@ -1325,7 +1386,7 @@ class OptimizerLoop:
             else:
                 params_to_clip = self.unet.parameters()
             cliped_grad_norm = self.accelerator.clip_grad_norm_(
-                params_to_clip, self.args.clip_grad_norm_global)
+                params_to_clip, self.args.clip_grad_norm)
         logs.update({
                 "cliped_grad_norm":
                 float(cliped_grad_norm.item()),
@@ -1370,7 +1431,7 @@ class OptimizerLoop:
                 print('negative prompt:', negative_prompt)
 
         def build_embed(prompt):
-            if self._stop_text_percentage == 0:
+            if not self._any_train_tenc:
                 if prompt in self._embeds_cache:
                     return self._embeds_cache[prompt].to(
                         self.accelerator.device)
@@ -1388,7 +1449,7 @@ class OptimizerLoop:
                     self.tokenizer,
                     prompt,
                     self.accelerator.device)
-            if self._stop_text_percentage == 0:
+            if not self._any_train_tenc:
                 self._embeds_cache[prompt] = embeds.cpu()
             return embeds
 
@@ -1621,16 +1682,80 @@ class OptimizerLoop:
         optimizer = (self.instance_optimizer
                      if self.args.split_optimizer and is_instance_batch
                      else self.optimizer)
+        lr_scheduler = (self.instance_lr_scheduler
+                     if self.args.split_optimizer and is_instance_batch
+                     else self.lr_scheduler)
         if is_first_step:
             optimizer.first_step()
         elif is_second_step:
             optimizer.second_step()
+            lr_scheduler.step()
         else:
             optimizer.step()
+            lr_scheduler.step()
+
+    class GradModifier:
+        def __init__(self, args, accelerator):
+            self.accelerator = accelerator
+            self.args = args
+            self._prior_grads = []
+            self._instance_grads = []
+            self._ema_prior_grad_norms = []
+            self._ema_instance_grad_norms = []
+            self._ema_beta = 0.01
+
+        @torch.no_grad()
+        def _save_params(self, filename, params, param_grads):
+            if self.accelerator.is_main_process:
+                torch.save(
+                    (params, param_grads),
+                    os.path.join(
+                        self.args.model_dir,
+                        'logging',
+                        filename))
+
+        def modify_grads(self,
+                         params,
+                         param_grads,
+                         is_instance_batch,
+                         counter,
+                         logs):
+            def save_params(filename):
+                self._save_params(filename, params, param_grads)
+
+            if self.args.split_optimizer:
+                file_name_prefix = ('instance_'
+                                    if is_instance_batch
+                                    else 'prior_')
+            else:
+                file_name_prefix = ''
+            if self.args.save_params_step:
+                save_params(
+                    f'{file_name_prefix}params_{counter.epoch}'
+                    f'_{counter.step}.pt')
+
+            if self.args.split_optimizer:
+                if is_instance_batch:
+                    pass
+                    # try_copy(param_grads, self._instance_grads)
+                else:
+                    try_copy(param_grads, self._prior_grads)
+
+                if (is_instance_batch
+                        and len(param_grads) > 0
+                        and len(self._prior_grads) > 0):
+                    if self.args.split_optimizer_without_offset:
+                        if on_first_call():
+                            print('split_optimizer/offset_by_grad_ is dry_run')
+                    offset_by_grad_(
+                        param_grads,
+                        self._prior_grads,
+                        logs,
+                        is_dry_run=self.args.split_optimizer_without_offset)
 
     class LoopCounter:
         def __init__(self, args, max_epochs, step_increment, global_step=0):
-            self._args = args
+            self.args = args
             self._max_epochs = max_epochs
             self._step_increment = step_increment
 
@@ -1639,22 +1764,38 @@ class OptimizerLoop:
             self.step = 0
 
         def __iter__(self):
+            init_args_epoch = self.args.epoch
             for epoch in range(self._max_epochs):
-                yield epoch
                 self.step = 0
-                self.epoch += 1
+                self.epoch = epoch
+                self.args.epoch = init_args_epoch + epoch
+                yield epoch
 
         def __len__(self):
             return self._max_epochs
 
         @contextlib.contextmanager
         def step_context(self):
-            self._args.revision += self._step_increment
+            self.args.revision += self._step_increment
             try:
                 yield
             finally:
                 self.step += self._step_increment
                 self.global_step += self._step_increment
+
+    def _fetch_latents(self, batch):
+        def maybe_encode(maybe_latent):
+            # is_latent, tensor = maybe_latent
+            is_latent = maybe_latent.shape[0] == 4
+            tensor = maybe_latent
+            if is_latent:
+                return tensor.to(self.accelerator.device)
+            else:
+                return self._vae_encoder.encode(tensor.unsqueeze(0)).squeeze(0)
+        latents = torch.stack([maybe_encode(maybe_latent)
+                               for maybe_latent
+                               in batch["images"]])
+        return latents
 
     class TrainingCompleteException(Exception):
         def __init__(self):
@@ -1678,7 +1819,7 @@ class OptimizerLoop:
             with context(model):
                 yield
 
-        if self._stop_text_percentage == 0:
+        if not self._any_train_tenc:
             self._embeds_cache = {}
             self.text_encoder.to(self.accelerator.device,
                                  dtype=self._weight_dtype)
@@ -1691,7 +1832,8 @@ class OptimizerLoop:
 
         save_checker = self.SaveChecker(self.args, self, max_train_epochs)
 
-        os.environ.__setattr__("CUDA_LAUNCH_BLOCKING", 1)
+        # for debug?
+        # os.environ.__setattr__("CUDA_LAUNCH_BLOCKING", 1)
 
         # Only show the progress bar once on each machine.
         progress_bar = mytqdm(
@@ -1711,7 +1853,7 @@ class OptimizerLoop:
         msg = ""
 
         last_tenc = 0 < text_encoder_epochs
-        if self._stop_text_percentage == 0:
+        if not self._any_train_tenc:
             last_tenc = False
 
         self.noise_scheduler.set_timesteps(
@@ -1720,20 +1862,27 @@ class OptimizerLoop:
         if self.accelerator.num_processes == 1:
             self._build_hist()
 
-        if self.args.split_optimizer:
-            prior_grads = []
-
         l2_regularization = L2Regularization(self.args)
         ewc = EWC(self.args, self.accelerator.device)
 
         counter = self.LoopCounter(
             self.args, max_train_epochs, self._total_batch_size)
+        grad_modifier = self.GradModifier(self.args, self.accelerator)
         for epoch in counter:
+            if self.args.num_train_epochs > 1:
+                if epoch >= max_train_epochs:
+                    raise self.TrainingCompleteException()
+
+            if self.accelerator.is_main_process:
+                save_checker.checked_save(
+                    counter.epoch,
+                    is_epoch_check=True)
+
             if self.args.train_unet:
                 self.unet.train()
 
             train_tenc = epoch < text_encoder_epochs
-            if self._stop_text_percentage == 0:
+            if not self._any_train_tenc:
                 train_tenc = False
 
             if self.args.freeze_clip_normalization:
@@ -1762,7 +1911,7 @@ class OptimizerLoop:
                 self.args, current_epoch=epoch
             )
 
-            param_stat_save = PramStatSave(
+            param_stat_save = ParamStatSave(
                 os.path.join(self.args.model_dir, 'logging'),
                 epoch) if self.args.save_params_stat else None
 
@@ -1771,7 +1920,6 @@ class OptimizerLoop:
                           is_first_step=False,
                           is_second_step=False):
                 logs = {}
-
                 # Add noise to the latents according
                 # to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -1829,31 +1977,20 @@ class OptimizerLoop:
                 noise_prods = self.noise_scheduler.calc_noise_prod(prev_ts)
 
                 assert self.args.split_loss
-                ((model_pred_instance,
-                  target,
-                  instance_noise_prod),
-                 (model_pred_prior,
-                  target_prior,
-                  prior_noise_prod)) = self._split_outputs(
+                (instance_outputs,
+                 prior_outputs) = self._split_outputs(
                   pred,
                   target,
                   noise_prods,
                   batch['types'])
-                is_instance_batch = model_pred_instance is not None
-                is_prior_batch = model_pred_prior is not None
+                is_instance_batch = instance_outputs[0] is not None
+                is_prior_batch = prior_outputs[0] is not None
                 # Concatenate the chunks in instance_chunks
                 # to form the model_pred_instance tensor
                 if is_instance_batch:
                     instance_loss = self._loss_fn(
-                        model_pred_instance,
-                        target,
-                        instance_noise_prod,
+                        *instance_outputs,
                         True)
-                    if self.args.clip_loss > 0.0:
-                        if instance_loss > self.args.clip_loss:
-                            instance_loss = torch.minimum(
-                                instance_loss, torch.tensor(
-                                    self.args.clip_loss))
                     logs.update({
                             "inst/loss":
                             float(instance_loss.detach().item()),
@@ -1863,9 +2000,7 @@ class OptimizerLoop:
 
                 if is_prior_batch:
                     prior_loss = self._loss_fn(
-                        model_pred_prior,
-                        target_prior,
-                        prior_noise_prod,
+                        *prior_outputs,
                         False)
                     logs.update({
                             "prior/loss":
@@ -1898,38 +2033,17 @@ class OptimizerLoop:
                         param_grads = [p.grad for p in params]
                         if param_stat_save is not None:
                             param_stat_save.step(params, param_grads)
-
-                        @torch.no_grad()
-                        @self.accelerator.on_main_process
-                        def save_params(filename):
-                            torch.save(
-                                (params, param_grads),
-                                os.path.join(
-                                    self.args.model_dir,
-                                    'logging',
-                                    filename))
-
-                    if self.args.split_optimizer:
-                        if is_instance_batch:
-                            if (len(param_grads) > 0
-                                    and len(prior_grads) > 0):
-                                if self.args.save_params_step:
-                                    save_params(
-                                        f'instance_params_{counter.epoch}'
-                                        f'_{counter.step}.pt')
-                                offset_by_grad_(param_grads,
-                                                prior_grads,
-                                                logs)
-                        else:
-                            try_copy(param_grads, prior_grads)
-                            if self.args.save_params_step:
-                                save_params(
-                                    f'prior_params_{counter.epoch}'
-                                    f'_{counter.step}.pt')
                     else:
-                        if self.args.save_params_step:
-                            save_params(f'params_{counter.epoch}'
-                                        f'_{counter.step}.pt')
+                        params = None
+                        param_grads = None
+
+                    grad_modifier.modify_grads(
+                        params=params,
+                        param_grads=param_grads,
+                        is_instance_batch=is_instance_batch,
+                        counter=counter,
+                        logs=logs,
+                    )
 
                     l2_regularization.update_grad_norm(
                         self._clip_grad_norm(train_tenc, logs))
@@ -1938,17 +2052,10 @@ class OptimizerLoop:
                                          is_first_step,
                                          is_second_step)
 
-                    self.lr_scheduler.step()
-                    if self.args.split_optimizer:
-                        self.instance_lr_scheduler.step()
-
-                    if self.accelerator.sync_gradients:
-                        if self.args.use_ema and self.ema_model is not None:
-                            self.ema_model.step(self.unet)
+                    if self.args.use_ema and self.ema_model is not None:
+                        self.ema_model.step(self.unet)
                     if self._profiler is not None:
                         self._profiler.step()
-
-                    # wrapped .zero_grad() is called if sync_gradients
                     self.optimizer.zero_grad(
                         set_to_none=self.args.gradient_set_to_none)
 
@@ -2009,6 +2116,20 @@ class OptimizerLoop:
                     raise InterruptedError()
 
                 return loss_step
+            param_model = self.NoSyncParametersPseudoModel(
+                self._extract_optimizer_parameters(),
+                [self.unet, self.text_encoder])
+            is_local_sgd_enabled = self.args.local_sgd_steps > 0
+            local_sgd_context = LocalSGD(
+                accelerator=self.accelerator,
+                model=param_model,
+                local_sgd_steps=self.args.local_sgd_steps,
+                enabled=is_local_sgd_enabled,
+            )
+            if is_local_sgd_enabled:
+                self.accelerator.print(
+                    'Local SGD is enabled:',
+                    self.args.local_sgd_steps)
             try:
                 if 'SAM' in self.args.optimizer:
                     repeat_count = self._gradient_accumulation_steps
@@ -2023,7 +2144,7 @@ class OptimizerLoop:
                     latentss = []
                     noises = []
 
-                    def accum_step(is_first_step, is_second_step):
+                    def accum_step(is_first_step, is_second_step, local_sgd):
                         nonlocal loss_total
                         for batch, latents, timesteps, noise in zip(
                                 batches, latentss, timestepss, noises):
@@ -2038,83 +2159,80 @@ class OptimizerLoop:
                                     noise=noise,
                                     is_first_step=is_first_step,
                                     is_second_step=is_second_step)
-                    syncronize_python_rng_state()
-                    for step, batch in enumerate(self.train_dataloader):
-                        if self.accelerator.gradient_state.end_of_dataloader:
-                            with self.accelerator.accumulate(None):
-                                pass
-                            break
-                        # Sample a random timestep for each image
-                        timesteps = torch.randint(
-                            0,
-                            self.noise_scheduler.config.num_train_timesteps,
-                            (self._train_batch_size,),
-                            device=self.accelerator.device,
-                        ).long()
-                        latents = batch["images"].to(self.accelerator.device)
-                        # Sample noise that we'll add to the latents
-                        noise = self._bulid_noise(latents)
-
-                        batches.append(batch)
-                        timestepss.append(timesteps)
-                        latentss.append(latents)
-                        noises.append(noise)
-
-                        if step % repeat_count == repeat_count - 1:
-                            if accum_step(True, False):
+                                if is_second_step:
+                                    local_sgd.step()
+                    with local_sgd_context as local_sgd:
+                        syncronize_python_rng_state(self.accelerator)
+                        for step, batch in enumerate(self.train_dataloader):
+                            # flush step
+                            if self.accelerator.gradient_state.end_of_dataloader:
+                                with self.accelerator.accumulate(None):
+                                    pass
                                 break
-                            if accum_step(False, True):
-                                break
-                            batches = []
-                            timestepss = []
-                            latentss = []
-                            noises = []
+                            # collect batches for accumulation
+                            # Sample a random timestep for each image
+                            timesteps = torch.randint(
+                                0,
+                                self.noise_scheduler.config.num_train_timesteps,
+                                (self._train_batch_size,),
+                                device=self.accelerator.device,
+                            ).long()
+                            latents = self._fetch_latents(batch)
+                            # Sample noise that we'll add to the latents
+                            noise = self._bulid_noise(latents)
+
+                            batches.append(batch)
+                            timestepss.append(timesteps)
+                            latentss.append(latents)
+                            noises.append(noise)
+
+                            if step % repeat_count == repeat_count - 1:
+                                if accum_step(True, False, local_sgd):
+                                    break
+                                if accum_step(False, True, local_sgd):
+                                    break
+                                batches = []
+                                timestepss = []
+                                latentss = []
+                                noises = []
                 else:
-                    # for synchronize sampler
-                    syncronize_python_rng_state()
-                    for step, batch in enumerate(self.train_dataloader):
-                        # Sample a random timestep for each image
-                        timesteps = torch.randint(
-                            0,
-                            self.noise_scheduler.config.num_train_timesteps,
-                            (self._train_batch_size,),
-                            device=self.accelerator.device,
-                        ).long()
-                        latents = batch["images"].to(self.accelerator.device)
-                        # Sample noise that we'll add to the latents
-                        noise = self._bulid_noise(latents)
+                    with local_sgd_context as local_sgd:
+                        # for synchronize sampler
+                        syncronize_python_rng_state(self.accelerator)
+                        for batch in self.train_dataloader:
+                            # Sample a random timestep for each image
+                            timesteps = torch.randint(
+                                0,
+                                self.noise_scheduler.config.num_train_timesteps,
+                                (self._train_batch_size,),
+                                device=self.accelerator.device,
+                            ).long()
+                            latents = self._fetch_latents(batch)
+                            # Sample noise that we'll add to the latents
+                            noise = self._bulid_noise(latents)
 
-                        with (self.accelerator.accumulate(None),
-                              slave_sync(self.unet),
-                              slave_sync(self.text_encoder),
-                              counter.step_context()):
-                            loss_total += loop_step(
-                                counter, batch,
-                                latents=latents,
-                                timesteps=timesteps,
-                                noise=noise)
+                            with (self.accelerator.accumulate(None),
+                                  slave_sync(self.unet),
+                                  slave_sync(self.text_encoder),
+                                  counter.step_context()):
+                                loss_total += loop_step(
+                                    counter, batch,
+                                    latents=latents,
+                                    timesteps=timesteps,
+                                    noise=noise)
+                                local_sgd.step()
 
                 if param_stat_save is not None:
                     param_stat_save.epoch_end()
 
-                logs = {"epoch_loss": loss_total / len(self.train_dataloader)}
+                logs = {"epoch_loss": loss_total / counter.step}
                 self.accelerator.log(logs, step=counter.global_step)
 
-                self.accelerator.wait_for_everyone()
+                # self.accelerator.wait_for_everyone()
 
-                self.args.epoch += 1
                 self.lr_scheduler.step(is_epoch=True)
                 status.job_count = max_train_steps
                 status.job_no = counter.global_step
-
-                if self.accelerator.is_main_process:
-                    save_checker.checked_save(
-                        epoch,
-                        is_epoch_check=True)
-
-                if self.args.num_train_epochs > 1:
-                    if epoch >= max_train_epochs:
-                        raise self.TrainingCompleteException()
 
             except (self.TrainingCompleteException, InterruptedError) as e:
                 print("  Training complete (step check).")
@@ -2269,7 +2387,7 @@ class OptimizerLoop:
 
                             modelmap = {"unet": (s_pipeline.unet, tgt_module)}
                             # save text_encoder
-                            if self._stop_text_percentage != 0:
+                            if self._any_train_tenc:
                                 out_txt = out_file.replace(".pt", "_txt.pt")
                                 modelmap["text_encoder"] = (
                                     s_pipeline.text_encoder,

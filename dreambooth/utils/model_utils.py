@@ -246,7 +246,8 @@ def xformerify(obj):
 def torch2ify(unet):
     if hasattr(torch, 'compile'):
         try:
-            unet = torch.compile(unet, mode="max-autotune", fullgraph=False)
+            # unet = torch.compile(unet, mode="max-autotune", fullgraph=False)
+            unet = torch.compile(unet, fullgraph=False)
         except:
             pass
     return unet

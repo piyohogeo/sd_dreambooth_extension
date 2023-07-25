@@ -128,6 +128,7 @@ def sort_prompts(
             steps=int(parameters['Steps']),
             scale=float(parameters['CFG scale']),
             resolution=reso,
+            original_resolution=(w, h),
             concept_index=concept_index,
             is_class_image=is_class_image,
             weight=weight,

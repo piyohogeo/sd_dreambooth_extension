@@ -16,10 +16,19 @@ from diffusers import AutoencoderKL
 from diffusers.models.vae import DiagonalGaussianDistribution
 
 
-def vae_encode(encoder, quant_conv, img):
-    h = encoder(img)
-    moments = quant_conv(h)
-    return DiagonalGaussianDistribution(moments).sample()
+class VAEEncoder:
+    def __init__(self, vae):
+        self._device = vae.device
+        self._dtype = vae.dtype
+        self._encoder = vae.encoder
+        self._quant_conv = vae.quant_conv
+        self._scaling_factor = vae.config.scaling_factor
+
+    def encode(self, img):
+        h = self._encoder(img.to(self._device).to(self._dtype))
+        moments = self._quant_conv(h)
+        latent = DiagonalGaussianDistribution(moments).sample()
+        return latent * self._scaling_factor
 
 
 class DbDatasetForResolution(torch.utils.data.Dataset):
@@ -49,14 +58,14 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
                 transforms.Normalize(0.5, 0.5),
             ]
         )
+
+        self._vae_encoder = VAEEncoder(vae)
+
         if vae is not None:
             self._calc_vae_hash(vae)
             self._cache_latents(vae)
 
-        self._vae_encoder = vae.encoder
-        self._vae_quant_conv = vae.quant_conv
-        self._vae_scaling_factor = vae.config.scaling_factor
-
+    @torch.no_grad()
     def _load_image(self, image_path):
         flip_index = random.randint(0, 1) if self._hflip else 0
         if image_path in self._latents_cache:
@@ -67,14 +76,7 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
             img_tensor = self._image_transforms(image)
             if flip_index == 1:
                 img_tensor = transforms.functional.hflip(img_tensor)
-            img_tensor = img_tensor.to(
-                device=self._vae_encoder.device,
-                dtype=self._vae_encoder.dtype)
-            with torch.no_grad():
-                latent = vae_encode(self._vae_encoder,
-                                    self._vae_quant_conv,
-                                    img_tensor)
-                return latent * self._vae_scaling_factor
+            return self._vae_encoder.encode(img_tensor.unsqueeze(0)).squeeze(0)
 
     def _calc_vae_hash(self, vae):
         if hash(vae) in DbDatasetForResolution._VAE_HASH_CACHE:
@@ -86,6 +88,7 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
         print('vae hash:', self._vae_hash.hexdigest())
         DbDatasetForResolution._VAE_HASH_CACHE[hash(vae)] = self._vae_hash
 
+    @torch.no_grad()
     def _cache_latent(self, image_path, vae):
         image_path_dir, image_path_filename = os.path.split(image_path)
         latent_dir = os.path.join(image_path_dir,
@@ -112,9 +115,7 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
 
         img_tensors = torch.stack([img_tensor, fliped_img_tensor])
         img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
-        with torch.no_grad():
-            latents = vae.encode(img_tensors).latent_dist.sample().cpu()
-            latents = latents * vae.config.scaling_factor
+        latents = self._vae_encoder.encode(img_tensors).cpu()
         self._latents_cache[image_path] = torch.unbind(latents)
 
         tmp_latent_path = latent_path\

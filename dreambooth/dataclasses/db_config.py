@@ -66,6 +66,8 @@ class DreamboothConfig(BaseModel):
     initial_revision: int = 0
     l2_regularization: bool = False
     l2_regularization_lambda: float = 1e-5
+    l2_regularization_adaptive: bool = False
+    l2_regularization_ema_beta: float = 0.05
     learning_rate: float = 5e-6
     learning_rate_min: float = 1e-6
     lifetime_revision: int = 0
@@ -103,6 +105,7 @@ class DreamboothConfig(BaseModel):
     prior_loss_weight_min: float = 0.1
     resolution: int = 512
     revision: int = 0
+    sam_rho: float = 0.05
     sample_batch_size: int = 1
     sanity_prompt: str = ""
     sanity_seed: int = 420420

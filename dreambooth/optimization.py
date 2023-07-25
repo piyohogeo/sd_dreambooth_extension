@@ -513,69 +513,50 @@ class UniversalScheduler:
 
 
 def get_optimizer(args, params_to_optimize):
+    from torch.optim import AdamW
+    base_optimizer = AdamW
+    kwargs = {
+        'lr': args.learning_rate,
+        'weight_decay': args.adamw_weight_decay,
+
+    }
     try:
-        if args.optimizer == "8bit AdamW":
+        if "8bit AdamW" in args.optimizer:
             from bitsandbytes.optim import AdamW8bit
-            return AdamW8bit(
-                params_to_optimize,
-                lr=args.learning_rate,
-                weight_decay=args.adamw_weight_decay,
-            )
-
-        elif args.optimizer == "Lion":
+            base_optimizer = AdamW8bit
+        elif "Lion" in args.optimizer:
             from lion_pytorch import Lion
-            return Lion(
-                params_to_optimize,
-                lr=args.learning_rate,
-                weight_decay=args.adamw_weight_decay,
-            )
-
-        elif args.optimizer == "SGD Dadaptation":
+            base_optimizer = Lion
+        elif "SGD Dadaptation" in args.optimizer:
             from dadaptation import DAdaptSGD
-            return DAdaptSGD(
-                params_to_optimize,
-                lr=args.learning_rate,
-                weight_decay=args.adamw_weight_decay,
-            )
-
-        elif args.optimizer == "AdamW Dadaptation":
+            base_optimizer = DAdaptSGD
+        elif "AdamW Dadaptation" in args.optimizer:
             from dadaptation import DAdaptAdam
-            return DAdaptAdam(
-                params_to_optimize,
-                lr=args.learning_rate,
-                weight_decay=args.adamw_weight_decay,
-                decouple=True,
-            )
-
-        elif args.optimizer == "Adagrad Dadaptation":
+            base_optimizer = DAdaptAdam
+            kwargs.update({
+                'decouple': True,
+            })
+        elif "Adagrad Dadaptation" in args.optimizer:
             from dadaptation import DAdaptAdaGrad
-            return DAdaptAdaGrad(
-                params_to_optimize,
-                lr=args.learning_rate,
-                weight_decay=args.adamw_weight_decay,
-            )
-
-        elif args.optimizer == "Adan Dadaptation":
+            base_optimizer = DAdaptAdaGrad
+        elif "Adan Dadaptation" in args.optimizer:
             from dreambooth.dadapt_adan import DAdaptAdan
-            return DAdaptAdan(
-                params_to_optimize,
-                lr=args.learning_rate,
-                weight_decay=args.adamw_weight_decay,
-            )
-
+            base_optimizer = DAdaptAdan
+        elif "AdaBound" in args.optimizer:
+            from adabound import AdaBound
+            base_optimizer = AdaBound
+            kwargs.update({
+                'final_lr': args.learning_rate * 100.0,
+                'gamma': args.learning_rate,
+            })
     except Exception as e:
         logger.warning(f"Exception importing {args.optimizer}: {e}")
         traceback.print_exc()
         print(str(e))
         print("WARNING: Using default optimizer (AdamW from Torch)")
+        args.optimizer += " using Torch AdamW"
 
-    args.optimizer = "Torch AdamW"
-    from torch.optim import AdamW
-    return AdamW(
-        params_to_optimize,
-        lr=args.learning_rate,
-        weight_decay=args.adamw_weight_decay,
-    )
+    return base_optimizer(params_to_optimize, **kwargs), kwargs
 
 
 def get_noise_scheduler(args):

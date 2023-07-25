@@ -143,3 +143,26 @@ class ResolutionedInstanceBalancedBatchSampler(BatchSampler):
             batch_size, samplers)
         return (res_sampler, res_sampler._concated_dataset)
 
+
+class RepeatedBatchSampler:
+    def __init__(self, base_sampler, repeat_length):
+        self._base_sampler = base_sampler
+        self._repeat_length = repeat_length
+
+    def __iter__(self):
+        base_iter = iter(self._base_sampler)
+        while True:
+            try:
+                to_repeat_batches = []
+                for _ in range(self._repeat_length):
+                    to_repeat_batches.append(next(base_iter))
+                # yield twice
+                for i in range(2):
+                    for batch_indexes in to_repeat_batches:
+                        yield batch_indexes
+            except StopIteration:
+                return
+
+    def __len__(self):
+        return ((len(self._base_sampler) // self._repeat_length)
+                * self._repeat_length * 2)

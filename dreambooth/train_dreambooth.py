@@ -1257,6 +1257,7 @@ class OptimizerLoop:
             guidance_scales = [example['guidance_scale']
                                for example in examples]
             images = [example["image"] for example in examples]
+            latent_masks = [example["latent_mask"] for example in examples]
             types = [example["is_class"] for example in examples]
 
             batch_data = {
@@ -1264,6 +1265,7 @@ class OptimizerLoop:
                 "negative_prompt": negative_prompts,
                 "guidance_scale": guidance_scales,
                 "images": images,
+                "latent_masks": latent_masks,
                 "types": types,
             }
             return batch_data
@@ -1519,106 +1521,120 @@ class OptimizerLoop:
             pred = noise_pred
         return pred
 
-    def _loss_fn(self, xs, ys, is_instance,
+    def _loss_fn(self, xs, ys, masks, is_instance,
                  kl_loss_gain=1.0):
-        def loss_fun_batch(x, y):
-            if ('instance_sqrt_mse' in self.args.loss_function_method
-                    and is_instance):
-                epsilon = 1e-4
-                if on_first_call():
-                    print('instance_sqrt_mse in',
-                          self.args.loss_function_method,
-                          is_instance)
-                return torch.sqrt(torch.nn.functional.mse_loss(
-                    xs.float(), ys.float(), reduction="mean"
-                ) + epsilon)
-            elif ('instance_inverse_mse' in self.args.loss_function_method
-                    and is_instance):
-                epsilon = 1e-2
-                if on_first_call():
-                    print('instance_inverse_mse in',
-                          self.args.loss_function_method,
-                          is_instance)
-                if self.args.train_loss_sharpness:
-                    return self.trainable_loss_sharpness(
-                        torch.nn.functional.mse_loss(
-                            xs.float(), ys.float(), reduction="mean"
-                        ) + epsilon)
-                else:
-                    if self.args.instance_loss_sharpness != 1.0:
-                        if on_first_call():
-                            print('instance_loss_sharpness:',
-                                  self.args.instance_loss_sharpness)
-                    return 1.0 / (torch.nn.functional.mse_loss(
-                        xs.float(), ys.float(), reduction="mean"
-                    ) + epsilon).pow(self.args.instance_loss_sharpness)
-            if 'instance_l1' in self.args.loss_function_method and is_instance:
-                if on_first_call():
-                    print('instance_l1 in',
-                          self.args.loss_function_method,
-                          is_instance)
-                return torch.nn.functional.l1_loss(
-                    xs.float(), ys.float(), reduction="mean"
-                )
-            elif ('instance_smoothl1sqrtmse' in self.args.loss_function_method
-                  and is_instance):
-                if on_first_call():
-                    print('instance_smoothl1sqrtmse',
-                          self.args.loss_function_method, is_instance)
-                sqrt_mse = torch.sqrt(
-                        torch.nn.functional.mse_loss(
-                            xs.float(), ys.float(), reduction="mean"))
-                beta = 1.0
-                return 2.0 * beta * torch.nn.functional.smooth_l1_loss(
-                    sqrt_mse, torch.zeros_like(sqrt_mse), beta=beta
-                )
-            elif ('instance_smoothl1' in self.args.loss_function_method
-                  and is_instance):
-                if on_first_call():
-                    print('instance_smoothl1 in',
-                          self.args.loss_function_method, is_instance)
-                return torch.nn.functional.smooth_l1_loss(
-                    xs.float(), ys.float(), reduction="mean", beta=1.0
-                )
-            elif 'kl' in self.args.loss_function_method:
-                assert xs.shape == ys.shape
+        xs = xs.float()
+        ys = ys.float()
+        is_mask_all_none = all([mask is None for mask in masks])
 
-                def kl_loss(pss, qss):
-                    assert pss.shape[0] == 1
-                    assert qss.shape[0] == 1
-                    pss = pss.squeeze(0)
-                    qss = qss.squeeze(0)
-                    return torch.mean(torch.stack(
-                        [calc_kl_divergence(ps.float(), qs.float())
-                         for ps, qs in zip(pss, qss)]))
-                return kl_loss_gain * kl_loss(x, y)
-            elif ('class_sqrt_mse' in self.args.loss_function_method
-                  and not is_instance):
-                epsilon = 1e-4
-                if on_first_call():
-                    print('class_sqrt_mse in',
-                          self.args.loss_function_method, is_instance)
-                return torch.sqrt(torch.nn.functional.mse_loss(
-                    xs.float(), ys.float(), reduction="mean"
-                ) + epsilon)
-            elif ('class_l1' in self.args.loss_function_method
-                  and not is_instance):
-                epsilon = 1e-4
-                if on_first_call():
-                    print('class_l1 in',
-                          self.args.loss_function_method, is_instance)
-                return torch.nn.functional.l1_loss(
-                    xs.float(), ys.float(), reduction="mean")
+        def masked_mse():
+            if not self.args.roi_loss_mask or is_mask_all_none:
+                return torch.nn.functional.mse_loss(
+                    xs, ys, reduction="mean")
+            else:
+                epsilon = 1e-3
+
+                def masked_mse_single(x, y, mask):
+                    if mask is None:
+                        return torch.nn.functional.mse_loss(
+                            x, y, reduction="mean")
+
+                    mask = mask.to(self.accelerator.device)
+                    if not is_instance:
+                        mask = 1.0 - mask
+                    return (torch.mean((x - y).pow(2.0) * mask)
+                            / (torch.mean(mask) + epsilon))
+                return torch.mean(torch.stack(
+                    [masked_mse_single(x, y, mask)
+                     for x, y, mask in zip(xs, ys, masks)]))
+
+        if ('instance_sqrt_mse' in self.args.loss_function_method
+                and is_instance):
+            epsilon = 1e-4
             if on_first_call():
-                print('default loss mse', is_instance)
-            return torch.nn.functional.mse_loss(
-                xs.float(), ys.float(), reduction="mean"
+                print('instance_sqrt_mse in',
+                      self.args.loss_function_method,
+                      is_instance)
+            return torch.sqrt(masked_mse() + epsilon)
+        elif ('instance_inverse_mse' in self.args.loss_function_method
+                and is_instance):
+            epsilon = 1e-2
+            if on_first_call():
+                print('instance_inverse_mse in',
+                      self.args.loss_function_method,
+                      is_instance)
+            if self.args.train_loss_sharpness:
+                return self.trainable_loss_sharpness(
+                    masked_mse() + epsilon)
+            else:
+                if self.args.instance_loss_sharpness != 1.0:
+                    if on_first_call():
+                        print('instance_loss_sharpness:',
+                              self.args.instance_loss_sharpness)
+                return 1.0 / (masked_mse()
+                              + epsilon).pow(self.args.instance_loss_sharpness)
+        if 'instance_l1' in self.args.loss_function_method and is_instance:
+            if on_first_call():
+                print('instance_l1 in',
+                      self.args.loss_function_method,
+                      is_instance)
+            return torch.nn.functional.l1_loss(
+                xs, ys, reduction="mean"
             )
-        batched_loss = torch.stack([loss_fun_batch(x, y)
-                                    for x, y in zip(xs, ys)])
-        assert batched_loss.shape[0] == xs.shape[0]
-        assert batched_loss.shape[0] == ys.shape[0]
-        return torch.mean(batched_loss)
+        elif ('instance_smoothl1sqrtmse' in self.args.loss_function_method
+                and is_instance):
+            epsilon = 1e-7
+            if on_first_call():
+                print('instance_smoothl1sqrtmse',
+                      self.args.loss_function_method, is_instance)
+            sqrt_mse = torch.sqrt(masked_mse() + epsilon)
+            beta = 1.0
+            return 2.0 * beta * torch.nn.functional.smooth_l1_loss(
+                sqrt_mse, torch.zeros_like(sqrt_mse), beta=beta
+            )
+        elif ('instance_smoothl1' in self.args.loss_function_method
+                and is_instance):
+            if on_first_call():
+                print('instance_smoothl1 in',
+                      self.args.loss_function_method, is_instance)
+            return torch.nn.functional.smooth_l1_loss(
+                xs, ys, reduction="mean", beta=1.0
+            )
+        elif 'kl' in self.args.loss_function_method:
+            assert xs.shape == ys.shape
+
+            def kl_loss(pss, qss):
+                assert pss.shape[0] == 1
+                assert qss.shape[0] == 1
+                pss = pss.squeeze(0)
+                qss = qss.squeeze(0)
+                return torch.mean(torch.stack(
+                    [calc_kl_divergence(ps.float(), qs.float())
+                        for ps, qs in zip(pss, qss)]))
+            return torch.mean(
+                torch.stack([kl_loss_gain * kl_loss(x, y)
+                             for x, y
+                             in zip(xs, ys)]))
+        elif ('class_sqrt_mse' in self.args.loss_function_method
+                and not is_instance):
+            epsilon = 1e-4
+            if on_first_call():
+                print('class_sqrt_mse in',
+                      self.args.loss_function_method, is_instance)
+            return torch.sqrt(masked_mse() + epsilon)
+        elif ('class_l1' in self.args.loss_function_method
+                and not is_instance):
+            epsilon = 1e-4
+            if on_first_call():
+                print('class_l1 in',
+                      self.args.loss_function_method, is_instance)
+            return torch.nn.functional.l1_loss(
+                xs, ys, reduction="mean")
+        if on_first_call():
+            print('default loss mse', is_instance)
+        return torch.nn.functional.mse_loss(
+            xs, ys, reduction="mean"
+        )
 
     def _extract_optimizer_parameters(self, is_check_grad=False):
         return extract_optimizer_parameters(self.optimizer, is_check_grad)
@@ -1815,15 +1831,17 @@ class OptimizerLoop:
     def _split_outputs(self,
                        pred,
                        target,
+                       latent_masks,
                        is_priors):
         def filter_chunk(is_prior):
             xss = list(zip(*[xs for xs
                              in zip(pred,
                                     target,
+                                    latent_masks,
                                     is_priors)
                              if is_prior == xs[-1]]))
             if len(xss) > 0:
-                return tuple(map(torch.stack, xss[:-1]))
+                return (*map(torch.stack, xss[:-2]), xss[-2])
             else:
                 return None
         instance_chunks = filter_chunk(False)
@@ -2131,9 +2149,11 @@ class OptimizerLoop:
             assert pred.shape == target.shape
             assert self.args.split_loss
             (instance_outputs,
-                prior_outputs) = self._split_outputs(pred,
-                                                     target,
-                                                     batch['types'])
+                prior_outputs) = self._split_outputs(
+                    pred,
+                    target,
+                    batch['latent_masks'],
+                    batch['types'])
             is_instance_batch = instance_outputs is not None
             is_prior_batch = prior_outputs is not None
             # Concatenate the chunks in instance_chunks

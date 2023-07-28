@@ -1,7 +1,7 @@
 import json
 import random
 from dataclasses import dataclass, asdict
-from typing import Tuple
+from typing import Tuple, List, Optional
 
 
 @dataclass
@@ -20,6 +20,7 @@ class PromptData:
     concept_index: int = 0
     is_class_image: bool = False
     weight: float = 1.0
+    roi_rects: Optional[List[Tuple[int, int, int, int]]] = None
 
     def __post_init__(self):
         if self.seed == -1:

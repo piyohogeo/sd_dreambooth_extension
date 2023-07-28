@@ -117,8 +117,12 @@ class DreamboothConfig(BaseModel):
     prior_loss_target: int = 100
     prior_loss_weight: float = 0.75
     prior_loss_weight_min: float = 0.1
+    prompt_drop_non_quality_tag: bool = False
+    prompt_drop_non_quality_tag_rate: float = 0.1
     resolution: int = 512
     revision: int = 0
+    roi_loss_mask: bool = False
+    roi_loss_mask_is_instance: bool = False
     sam_rho: float = 0.05
     sample_batch_size: int = 1
     sanity_prompt: str = ""

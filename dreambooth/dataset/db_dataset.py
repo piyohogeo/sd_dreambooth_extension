@@ -52,7 +52,6 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
         self._resolution = resolution
         self._image_transforms = transforms.Compose(
             [
-                transforms.RandomCrop(resolution),
                 transforms.ToTensor(),
                 transforms.Normalize(0.5, 0.5),
             ]
@@ -68,18 +67,48 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
             self._cache_latents(vae_encoder)
 
     @torch.no_grad()
-    def _load_image(self, image_path):
+    def _load_image(self, image_path, mask_rects):
         flip_index = random.randint(0, 1) if self._hflip else 0
+
+        def build_masked_latent(crop_x=0, crop_y=0):
+            if mask_rects is None:
+                return None
+
+            LATENT_DIV = 8
+            latent_resolution = (self._resolution[0] // LATENT_DIV,
+                                 self._resolution[1] // LATENT_DIV)
+            mask = torch.zeros(latent_resolution, dtype=torch.float32)
+            for mask_rect in mask_rects:
+                mask_rect = list(map(int, mask_rect))
+                latent_x0 = max((mask_rect[0] - crop_x) // LATENT_DIV, 0)
+                latent_y0 = max((mask_rect[1] - crop_y) // LATENT_DIV, 0)
+                latent_x1 = max((mask_rect[2] - crop_x + LATENT_DIV - 1) // LATENT_DIV, 0)
+                latent_y1 = max((mask_rect[3] - crop_y + LATENT_DIV - 1) // LATENT_DIV, 0)
+                mask[latent_y0:latent_y1,
+                     latent_x0:latent_x1] = 1.0
+            mask = torch.reshape(mask, (1, *latent_resolution))
+            if flip_index == 1:
+                mask = transforms.functional.hflip(mask)
+            mask = torch.broadcast_to(mask, (4, *latent_resolution))
+            return mask
 
         latents = self._load_latent_cache(image_path)
         if latents is not None:
-            return latents[flip_index]
+            lantent_mask = build_masked_latent()
+            return latents[flip_index], lantent_mask
         else:
             image = Image.open(image_path)
+            crop_x = random.randint(0, image.size[0] - self._resolution[0])
+            crop_y = random.randint(0, image.size[1] - self._resolution[1])
+            image = image.crop((crop_x,
+                                crop_y,
+                                crop_x + self._resolution[0],
+                                crop_y + self._resolution[1]))
             img_tensor = self._image_transforms(image)
             if flip_index == 1:
                 img_tensor = transforms.functional.hflip(img_tensor)
-            return img_tensor
+            lantent_mask = build_masked_latent(crop_x, crop_y)
+            return img_tensor, lantent_mask
 
     def _calc_vae_hash(self, vae):
         if hash(vae) in DbDatasetForResolution._VAE_HASH_CACHE:
@@ -165,14 +194,16 @@ class DbDatasetForResolution(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         prompt_data = self._prompts[index]
-        image_data = self._load_image(prompt_data.src_image)
+        image_data, latent_mask = self._load_image(
+            prompt_data.src_image, prompt_data.roi_rects)
         example = {
             "image": image_data,
             "prompt": prompt_data.prompt,
             "negative_prompt": prompt_data.negative_prompt,
             "guidance_scale": prompt_data.scale,
             "res": self._resolution,
-            "is_class": prompt_data.is_class_image
+            "is_class": prompt_data.is_class_image,
+            "latent_mask": latent_mask,
         }
         return example
 

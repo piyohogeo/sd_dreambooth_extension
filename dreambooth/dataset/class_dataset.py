@@ -3,7 +3,7 @@ import os
 import pickle
 import threading
 
-from typing import Callable, Optional
+from typing import List, Optional
 
 from dreambooth import shared
 from dreambooth.dataclasses.db_concept import Concept
@@ -17,7 +17,7 @@ from helpers.mytqdm import mytqdm
 class ClassDataset:
     """A simple dataset to prepare the prompts to generate class images on multiple GPUs."""
 
-    def __init__(self, concepts: [Concept],
+    def __init__(self, concepts: List[Concept],
                  max_width: int,
                  parameter_weight_tag: str = 'TrainingWeight',
                  prompt_tag: Optional[str] = None):

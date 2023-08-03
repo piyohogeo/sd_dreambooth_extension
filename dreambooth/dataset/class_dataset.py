@@ -3,6 +3,7 @@ import os
 import pickle
 import threading
 
+from joblib import Parallel, delayed
 from typing import List, Optional
 
 from dreambooth import shared
@@ -54,10 +55,12 @@ class ClassDataset:
             tmp_file_postfix = '.%08x.tmp' % threading.get_ident()
 
             def build_cache_path(is_instance, image_paths):
-                image_path_mtimes = [(
-                    image_paths,
-                    os.stat(json_getter.build_parameter_path(image_path)).st_mtime)
-                    for image_path in sorted(image_paths)]
+                def build_cache_key(image_path):
+                    return (
+                        image_path,
+                        os.stat(json_getter.build_parameter_path(image_path)).st_mtime)
+                image_path_mtimes = Parallel(n_jobs=8)(delayed(build_cache_key)(image_path) 
+                                                       for image_path in sorted(image_paths))
                 filename = hashlib.sha256(pickle.dumps(
                     (is_instance,
                      parameter_weight_tag,

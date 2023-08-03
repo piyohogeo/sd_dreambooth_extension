@@ -69,7 +69,6 @@ from dreambooth.utils.model_utils import (
 from dreambooth.utils.text_utils import encode_hidden_state
 
 from dreambooth.utils.utils import cleanup, printm, verify_locon_installed
-from dreambooth.xattention import optim_to
 from helpers.ema_model import EMAModel
 from helpers.log_parser import LogParser
 from helpers.mytqdm import mytqdm
@@ -80,13 +79,13 @@ from lora_diffusion.lora import (
     get_target_module,
 )
 
-from prompt_utils import build_embed_from_prompt
 from kimuraya.kimuraya_utils import on_first_call
 from kimuraya.image_preprocess_utils import QualityTagExtracter
 from kimuraya.stable_diffusion.model_utils import (
     load_lora_unet,
     load_lora_text_encoder,
     load_from_safetensor)
+from kimuraya.stable_diffusion.prompt_utils import build_embed_from_prompt
 from kimuraya.torch_utils import Histgram
 
 logger = logging.getLogger(__name__)
@@ -1241,17 +1240,13 @@ class OptimizerLoop:
         del vae
         cleanup()
 
-        def drop_quality_tag(prompt):
-            quality_tag_prompt, removed_prompt =\
-                QualityTagExtracter.extract(prompt, is_drop=True)
-            return removed_prompt + ', ' + quality_tag_prompt
-
         def collate_fn(examples):
-            # if _stop_text_percentage != 0:
-            #    prompts = [drop_quality_tag(example["prompt"])
-            #       for example in examples]
-            # else:
             prompts = [example["prompt"] for example in examples]
+            if self.args.prompt_drop_non_quality_tag:
+                prompts = [QualityTagExtracter.drop_non_quality_tag(
+                    prompt,
+                    drop_rate=self.args.prompt_drop_non_quality_tag_rate,
+                    ignore_head=True) for prompt in prompts]
             negative_prompts = [example["negative_prompt"]
                                 for example in examples]
             guidance_scales = [example['guidance_scale']
@@ -1532,8 +1527,6 @@ class OptimizerLoop:
                 return torch.nn.functional.mse_loss(
                     xs, ys, reduction="mean")
             else:
-                epsilon = 1e-3
-
                 def masked_mse_single(x, y, mask):
                     if mask is None:
                         return torch.nn.functional.mse_loss(
@@ -1542,8 +1535,19 @@ class OptimizerLoop:
                     mask = mask.to(self.accelerator.device)
                     if not is_instance:
                         mask = 1.0 - mask
-                    return (torch.mean((x - y).pow(2.0) * mask)
-                            / (torch.mean(mask) + epsilon))
+                    dif2 = (x - y).pow(2.0)
+                    if self.args.roi_loss_mask_detach:
+                        if on_first_call():
+                            print('roi_loss_mask_detach:', self.args.roi_loss_mask_detach)
+                        return torch.mean(dif2 * mask
+                                          + dif2.detach() * (1.0 - mask))
+                    else:
+                        if on_first_call():
+                            print('roi_loss_mask_epsilon:', self.args.roi_loss_mask_epsilon)
+                        return (torch.mean(dif2 * mask)
+                                / torch.minimum((torch.mean(mask) + self.args.roi_loss_mask_epsilon),
+                                                torch.tensor(1.0)))
+
                 return torch.mean(torch.stack(
                     [masked_mse_single(x, y, mask)
                      for x, y, mask in zip(xs, ys, masks)]))

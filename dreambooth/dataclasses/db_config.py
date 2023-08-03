@@ -123,6 +123,8 @@ class DreamboothConfig(BaseModel):
     revision: int = 0
     roi_loss_mask: bool = False
     roi_loss_mask_is_instance: bool = False
+    roi_loss_mask_epsilon: float = 1e-2
+    roi_loss_mask_detach: bool = False
     sam_rho: float = 0.05
     sample_batch_size: int = 1
     sanity_prompt: str = ""

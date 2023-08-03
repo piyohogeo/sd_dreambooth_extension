@@ -21,6 +21,7 @@ class PromptData:
     is_class_image: bool = False
     weight: float = 1.0
     roi_rects: Optional[List[Tuple[int, int, int, int]]] = None
+    mask_image: Optional[str] = None
 
     def __post_init__(self):
         if self.seed == -1:

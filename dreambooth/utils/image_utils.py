@@ -139,6 +139,7 @@ def sort_prompts(
             is_class_image=is_class_image,
             weight=weight,
             roi_rects=parameters['roi_rects'],
+            mask_image=parameters['mask_image'],
         )
         prompt_list.append(pd)
         pbar.update()
@@ -152,33 +153,51 @@ class FilenameJsonGetter:
     def __init__(self):
         pass
 
-    def build_parameter_path(self, img_path):
+    @staticmethod
+    def build_parameter_path(img_path):
         img_dir, img_filename = os.path.split(img_path)
         json_filepath = os.path.join(
             img_dir, 'parameters',
             os.path.splitext(img_filename)[0] + '.json')
         return json_filepath
 
-    def build_roi_path(self, img_path):
+    @staticmethod
+    def build_roi_path(img_path):
         img_dir, img_filename = os.path.split(img_path)
         roi_filepath = os.path.join(
             img_dir, 'roi',
             os.path.splitext(img_filename)[0] + '.json')
         return roi_filepath
 
-    def read_text(self, img_path):
-        json_filepath = self.build_parameter_path(img_path)
+    @staticmethod
+    def build_mask_path(img_path):
+        img_dir, img_filename = os.path.split(img_path)
+        roi_filepath = os.path.join(
+            img_dir, 'roi',
+            os.path.splitext(img_filename)[0] + '.png')
+        return roi_filepath
+
+    @staticmethod
+    def read_text(img_path):
+        json_filepath = FilenameJsonGetter.build_parameter_path(img_path)
 
         assert os.path.exists(json_filepath), img_path
         with open(json_filepath, "r", encoding="utf-8") as file:
             parameters = json.load(file)
 
-        roi_filepath = self.build_roi_path(img_path)
+        # roi json
+        roi_filepath = FilenameJsonGetter.build_roi_path(img_path)
         if os.path.exists(roi_filepath):
             with open(roi_filepath, 'r', encoding='utf-8') as f:
                 parameters['roi_rects'] = json.load(f)['roi_rects']
         else:
             parameters['roi_rects'] = None
+        # mask image
+        mask_filepath = FilenameJsonGetter.build_mask_path(img_path)
+        if os.path.exists(mask_filepath):
+            parameters['mask_image'] = mask_filepath
+        else:
+            parameters['mask_image'] = None
         return parameters
 
 
